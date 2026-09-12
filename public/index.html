@@ -25,6 +25,7 @@
       rel="stylesheet"
     />
     <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
@@ -581,7 +582,6 @@
       #messages-container {
         flex: 1;
         overflow-y: auto;
-        scroll-behavior: smooth;
         position: relative;
       }
       #messages-inner {
@@ -1530,6 +1530,7 @@
             </svg>
           </button>
           <div id="conv-title-display">Claude Chat</div>
+          <div id="conv-project-badge" style="display:none;font-size:11px;color:var(--text3);background:var(--bg3);border:1px solid var(--border);padding:2px 8px;border-radius:20px;white-space:nowrap;">📁</div>
           <div id="topbar-actions">
             <button
               class="topbar-btn"
@@ -1722,7 +1723,7 @@
       let currentConvId = null;
       let isStreaming = false;
       let abortController = null;
-      let currentModel = "gpt-oss:120b-cloud";
+      let currentModel = localStorage.getItem("lastModel") || "gpt-oss:120b-cloud";
       let availableModels = [];
       let pendingFiles = [];
       let searchDebounce = null;
@@ -1739,6 +1740,7 @@
           applyTheme();
         }
         await checkHealth();
+        document.getElementById("model-badge").textContent = currentModel;
         await loadConversations();
         setInterval(checkHealth, 15000);
         // Retry loading conversations if first attempt returned nothing (SW race on cold start)
@@ -1786,10 +1788,8 @@
       async function checkHealth() {
         try {
           const r = await fetch("/api/health");
-          const data = await r.json();
+          await r.json();
           setStatus("online");
-          currentModel = data.model || currentModel;
-          document.getElementById("model-badge").textContent = currentModel;
           loadModels();
         } catch {
           setStatus("offline");
@@ -1834,6 +1834,7 @@
 
       function selectModel(name) {
         currentModel = name;
+        localStorage.setItem("lastModel", name);
         document.getElementById("model-badge").textContent = name;
         document.getElementById("model-dropdown").classList.remove("open");
         renderModelDropdown();
@@ -1851,18 +1852,41 @@
       }
 
       // ── Scroll button ─────────────────────────────────────────────────────────────
+      // Design (matches ChatGPT/Claude/Gemini): auto-follow is ON by default.
+      // It is turned OFF only by a genuine user gesture that moves away from the
+      // bottom (wheel-up or an upward touch drag) — never by the generic 'scroll'
+      // event, which fires identically for our own programmatic scrolls and can't
+      // reliably distinguish user intent. It turns back ON automatically once the
+      // user (or a programmatic scroll) reaches the bottom again.
+      let userPinnedBottom = true;
       function setupScrollBtn() {
         const container = document.getElementById("messages-container");
         const btn = document.getElementById("scroll-btn");
+        function isAtBottom() {
+          return container.scrollHeight - container.scrollTop - container.clientHeight < 10;
+        }
         function checkScroll() {
-          const atBottom =
-            container.scrollHeight -
-              container.scrollTop -
-              container.clientHeight <
-            10;
-          btn.classList.toggle("visible", !atBottom);
+          // Only ever used to RE-PIN when we've reached the bottom; never to unpin.
+          if (isAtBottom()) userPinnedBottom = true;
+          btn.classList.toggle("visible", !isAtBottom());
         }
         container.addEventListener("scroll", checkScroll);
+        container.addEventListener("wheel", (e) => {
+          if (e.deltaY < 0 && !isAtBottom()) userPinnedBottom = false;
+        }, { passive: true });
+        let touchStartY = null;
+        container.addEventListener("touchstart", (e) => {
+          touchStartY = e.touches[0].clientY;
+        }, { passive: true });
+        container.addEventListener("touchmove", (e) => {
+          if (touchStartY === null) return;
+          const dy = e.touches[0].clientY - touchStartY;
+          if (dy > 0 && !isAtBottom()) userPinnedBottom = false; // dragging finger down = content moves up = scrolling up
+        }, { passive: true });
+        btn.addEventListener("click", () => {
+          userPinnedBottom = true;
+          scrollToBottom();
+        });
         // Re-check whenever messages change (after render, after stream tokens)
         window._checkScroll = checkScroll;
       }
@@ -2284,6 +2308,23 @@
           currentConvId = id;
           currentModel = data.model || currentModel;
           document.getElementById("model-badge").textContent = currentModel;
+          const badge = document.getElementById("conv-project-badge");
+          if (data.project_root) {
+            const ok = await openProjectFolderUI(data.project_root, { openPanel: false });
+            if (ok) {
+              badge.textContent = "📁 " + data.project_root.split(/[\\/]/).pop();
+              badge.title = data.project_root;
+              badge.style.display = "inline-block";
+            }
+            // On failure, openProjectFolderUI already set the "⚠ not found" badge itself.
+          } else {
+            projectRoot = null;
+            document.getElementById('project-btn').classList.remove('active');
+            document.getElementById('project-btn-label').textContent = '📁 Open Project Folder';
+            document.getElementById('project-btn-clear').style.display = 'none';
+            document.getElementById('projectPanel').classList.remove('open');
+            badge.style.display = "none";
+          }
           updateActiveConv(id);
           document.getElementById("conv-title-display").textContent =
             data.title;
@@ -2310,9 +2351,10 @@
           inner.innerHTML = getWelcomeHTML();
           return;
         }
-        messages.forEach((m) =>
-          appendMessage(m.role, m.content, false, m.id, m.created_at),
-        );
+        messages.forEach((m) => {
+          if (m.role === "steer") { renderSteerNote(inner, m.content); return; }
+          appendMessage(m.role, m.content, false, m.id, m.created_at);
+        });
         scrollToBottom();
         setTimeout(() => {
           if (window._checkScroll) window._checkScroll();
@@ -2321,6 +2363,15 @@
 
       async function startNewChat() {
         currentConvId = null;
+        // A brand-new conversation must start fully unlinked from any project —
+        // otherwise it would silently use whatever folder a previous conversation
+        // happened to have open, with no explicit action from the user.
+        projectRoot = null;
+        document.getElementById('project-btn').classList.remove('active');
+        document.getElementById('project-btn-label').textContent = '📁 Open Project Folder';
+        document.getElementById('project-btn-clear').style.display = 'none';
+        document.getElementById('projectPanel').classList.remove('open');
+        document.getElementById("conv-project-badge").style.display = "none";
         lastAssistantMsgId = null;
         lastUserMsgId = null;
         updateActiveConv(null);
@@ -2405,6 +2456,10 @@
 
         let attachHTML = "";
         let displayContent = content;
+        const MAX = 200000;
+        if (content.length > MAX) {
+          content = content.slice(0, MAX) + "\n\n...truncated...";
+        }
         if (isUser) {
           const lines = content.split("\n");
           const attLines = [],
@@ -2508,7 +2563,7 @@
         return w;
       }
 
-      function appendErrorMessage(msg) {
+      function appendErrorMessage(msg, retryFn) {
         const inner = document.getElementById("messages-inner");
         const d = document.createElement("div");
         d.className = "message-wrapper assistant";
@@ -2516,11 +2571,21 @@
           '<div class="msg-header"><div class="msg-avatar avatar-ai">✦</div><span>Assistant</span></div>' +
           '<div class="msg-bubble"><div class="error-msg">⚠ ' +
           escHtml(msg) +
-          "</div></div>";
+          '</div></div>' +
+          (retryFn ? '<div class="msg-actions"><button class="retry-btn">🔁 Retry</button></div>' : "");
         inner.appendChild(d);
+        if (retryFn) {
+          d.querySelector(".retry-btn").onclick = () => { d.remove(); retryFn(); };
+        }
         scrollToBottom();
       }
 
+      function renderSteerNote(container, note) {
+        const el = document.createElement("div");
+        el.style.cssText = "margin:6px 0 6px 40px;font-size:12.5px;color:var(--text3);font-style:italic;";
+        el.textContent = "🗨️ You steered: \"" + note + "\"";
+        container.appendChild(el);
+      }
       function renderToolActivity(container, data) {
         const label = {
           read_file: "📖 Reading", write_file: "📝 Writing", edit_file: "✏️ Editing",
@@ -2760,6 +2825,61 @@
       let projectRoot = null;
       let projectFileCount = 0;
 
+      // Populates the sidebar tree + button state for a given folder path. Used both
+      // when the user manually opens a folder and when a loaded conversation restores
+      // one automatically. Returns true on success, false if the folder is missing —
+      // callers decide how to surface that (toast vs. silent) without breaking chat,
+      // since the server already falls back gracefully to "no project" either way.
+      async function openProjectFolderUI(folderPath, { openPanel = true, silent = false } = {}) {
+        try {
+          const r = await fetch('/api/project/open', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ path: folderPath })
+          });
+          const data = await r.json();
+          if (data.error) {
+            projectRoot = null;
+            document.getElementById('project-btn').classList.remove('active');
+            document.getElementById('project-btn-label').textContent = '📁 Open Project Folder';
+            document.getElementById('project-btn-clear').style.display = 'none';
+            document.getElementById('projectPanel').classList.remove('open');
+            const badge = document.getElementById("conv-project-badge");
+            if (badge && !silent) {
+              badge.textContent = "⚠ Project folder not found";
+              badge.title = folderPath + " — no longer exists at this path";
+              badge.style.display = "inline-block";
+            }
+            if (!silent) showToast('Project folder not found: ' + folderPath, 4000);
+            return false;
+          }
+          projectRoot = data.path;
+          projectFileCount = countFiles(data.tree);
+          const tree = document.getElementById('projectTree');
+          tree.innerHTML = '';
+          renderTree(data.tree, tree);
+          const countEl = document.getElementById('projectFileCount');
+          countEl.innerHTML = '';
+          countEl.textContent = projectFileCount + ' files • ' + folderPath;
+          countEl.insertAdjacentHTML('afterend',
+            '<button id="reindex-btn" title="Re-index for semantic search" style="margin-left:8px;background:none;border:none;color:var(--text-dim);cursor:pointer;">🔄</button>');
+          document.getElementById('reindex-btn').onclick = () => {
+            fetch('/api/project/index', {
+              method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ path: projectRoot })
+            }).catch(() => {});
+            showToast('Re-indexing started...');
+          };
+          document.getElementById('project-btn-label').textContent = '📂 ' + folderPath.split(/[\\/]/).pop();
+          document.getElementById('project-btn-clear').style.display = 'inline';
+          document.getElementById('project-btn').classList.add('active');
+          if (openPanel) document.getElementById('projectPanel').classList.add('open');
+          return true;
+        } catch {
+          if (!silent) showToast('Could not reach server to open project folder', 3000);
+          return false;
+        }
+      }
+
       document.getElementById('project-btn').onclick = async (e) => {
         if (e.target.id === 'project-btn-clear') {
           projectRoot = null;
@@ -2773,24 +2893,25 @@
         if (projectRoot) { panel.classList.toggle('open'); return; }
         const folderPath = prompt('Absolute path to project folder:');
         if (!folderPath) return;
-        const r = await fetch('/api/project/open', {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ path: folderPath })
-        });
-        const data = await r.json();
-        if (data.error) { alert(data.error); return; }
-        projectRoot = data.path;
-        projectFileCount = countFiles(data.tree);
-        renderTree(data.tree, document.getElementById('projectTree'));
-        document.getElementById('projectFileCount').textContent = projectFileCount + ' files • ' + folderPath;
-        document.getElementById('project-btn-label').textContent = '📂 ' + folderPath.split(/[\\/]/).pop();
-        document.getElementById('project-btn-clear').style.display = 'inline';
-        document.getElementById('project-btn').classList.add('active');
-        panel.classList.add('open');
+        const ok = await openProjectFolderUI(folderPath, { openPanel: true });
+        if (ok) {
+          fetch('/api/project/index', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ path: projectRoot })
+          }).catch(() => {});
+        }
       };
 
       function countFiles(nodes) {
         return nodes.reduce((n, x) => n + (x.type === 'dir' ? countFiles(x.children) : 1), 0);
+      }
+
+      async function previewProjectFile(relPath) {
+        const fullPath = projectRoot + (projectRoot.includes('\\') ? '\\' : '/') + relPath;
+        const r = await fetch('/api/project/file?path=' + encodeURIComponent(fullPath) + '&root=' + encodeURIComponent(projectRoot));
+        const data = await r.json();
+        if (data.error) { alert(data.error); return; }
+        showFilePreviewModal(relPath, data.content); // simple <pre> in a modal/panel
       }
 
       function renderTree(nodes, container) {
@@ -2810,6 +2931,8 @@
             const label = document.createElement('div');
             label.className = 'file-label';
             label.textContent = '📄 ' + node.name;
+            label.style.cursor = 'pointer';
+            label.onclick = () => previewProjectFile(node.path);
             li.appendChild(label);
           }
           ul.appendChild(li);
@@ -2818,6 +2941,13 @@
       }
 
       // ── Send Message ──────────────────────────────────────────────────────────────
+      async function sendSteeringNote(note) {
+        if (!currentConvId || !note.trim()) return;
+        await fetch('/api/chat/steer', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversationId: currentConvId, note })
+        });
+      }
       async function sendMessage(overrideText) {
         const input = document.getElementById("message-input");
         const text = (overrideText || input.value).trim();
@@ -2837,14 +2967,6 @@
             showToast("Failed to create conversation");
             return;
           }
-        }
-
-        async function sendSteeringNote(note) {
-          if (!currentConvId || !note.trim()) return;
-          await fetch('/api/chat/steer', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ conversationId: currentConvId, note })
-          });
         }
 
         const welcome = document.getElementById("welcome");
@@ -2943,6 +3065,14 @@
             body: formData,
             signal: abortController.signal,
           });
+          if (!response.ok) {
+            let msg = "Request failed (" + response.status + ")";
+            try { msg = (await response.json()).error || msg; } catch {}
+            if (typingEl.parentNode) typingEl.remove();
+            appendErrorMessage(msg, () => sendMessage(overrideText));
+            setStreaming(false);
+            return;
+          }
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let partial = "";
@@ -2959,36 +3089,47 @@
                 const data = JSON.parse(line.slice(6));
                 if (data.error) {
                   if (typingEl.parentNode) typingEl.remove();
-                  appendErrorMessage(data.error);
+                  appendErrorMessage(data.error, () => sendMessage(overrideText));
                   setStreaming(false);
                   return;
                 }
                 if (data.type === "tool_start" || data.type === "tool_end") {
                   if (typingEl.parentNode) typingEl.remove();
                   renderToolActivity(inner, data);
-                  scrollToBottom();
+                  scrollToBottomIfNearBottom();
                   continue;
                 }
                 if (data.type === "diff_pending") {
                   if (typingEl.parentNode) typingEl.remove();
                   renderDiffCard(inner, data);
-                  scrollToBottom();
+                  scrollToBottomIfNearBottom();
                   continue;
                 }
                 if (data.type === "command_pending") {
                   if (typingEl.parentNode) typingEl.remove();
                   renderCommandCard(inner, data);
-                  scrollToBottom();
+                  scrollToBottomIfNearBottom();
                   continue;
                 }
                 if (data.type === "model_used" || data.modelUsed || data.model_used) {
                   const m = data.model || data.modelUsed || data.model_used;
                   currentModel = m;
+                  localStorage.setItem("lastModel", m);
                   document.getElementById("model-badge").textContent = m;
                   continue;
                 }
                 if (data.type === "model_fallback") {
                   showToast("Switching model (previous one failed)...");
+                  continue;
+                }
+                if (data.type === "steer_note") {
+                  renderSteerNote(inner, data.note);
+                  scrollToBottomIfNearBottom();
+                  continue;
+                }
+                if (data.type === "stream_reset") {
+                  buffer = "";
+                  if (streamWrapper) { streamWrapper.remove(); streamWrapper = null; streamBubble = null; }
                   continue;
                 }
                 if (data.token) {
@@ -3005,8 +3146,8 @@
                   }
                   buffer += data.token;
                   streamBubble.innerHTML = renderMarkdown(buffer);
-                  scrollToBottom();
-                } 
+                  scrollToBottomIfNearBottom();
+                }
                 if (data.done) {
                   newMsgId = data.messageId;
                   if (streamBubble) {
@@ -3038,6 +3179,7 @@
           }
         } catch (err) {
           if (err.name === "AbortError") {
+            if (typingEl.parentNode) typingEl.remove();
             if (streamBubble) streamBubble.classList.remove("streaming-cursor");
           } else {
             if (typingEl.parentNode) typingEl.remove();
@@ -3138,6 +3280,28 @@
         }
       }
 
+      function showFilePreviewModal(filename, content) {
+        // reuse same modal elements used in openPdfPreview
+        const modal = document.getElementById("pdfPreviewModal");   // same id used there
+        const title = document.getElementById("pdfPreviewTitle");
+        const body = document.getElementById("pdfPreviewBody");     // where iframe was inserted
+
+        title.textContent = filename;
+
+        // 🔥 Replace iframe with <pre>
+        body.innerHTML = `
+          <pre style="
+            white-space: pre-wrap;
+            overflow: auto;
+            max-height: 80vh;
+            font-family: monospace;
+            font-size: 13px;
+          ">${escHtml(content)}</pre>
+        `;
+
+        modal.style.display = "flex"; // same as openPdfPreview
+      }
+
       // ── Lightbox ──────────────────────────────────────────────────────────────────
       function openLightbox(src) {
         document.getElementById("lightbox-img").src = src;
@@ -3173,7 +3337,7 @@
       marked.use({ renderer });
       function renderMarkdown(text) {
         try {
-          return marked.parse(text || "");
+          return DOMPurify.sanitize(marked.parse(text || ""));
         } catch {
           return escHtml(text || "");
         }
@@ -3208,6 +3372,9 @@
         const c = document.getElementById("messages-container");
         c.scrollTop = c.scrollHeight;
         if (window._checkScroll) window._checkScroll();
+      }
+      function scrollToBottomIfNearBottom() {
+        if (userPinnedBottom) scrollToBottom();
       }
       function escHtml(s) {
         return String(s)

@@ -6,7 +6,7 @@ const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 const CHUNK_LINES = 60;
 const CHUNK_OVERLAP = 10;
 const IGNORE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.lock', '.db', '.zip', '.gz', '.mp4']);
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db']);
 
 function normRoot(root) {
   let r = path.resolve(root);

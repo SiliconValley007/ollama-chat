@@ -39,6 +39,7 @@ async function getDb() {
       CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
     `);
+    try { _db.run('ALTER TABLE conversations ADD COLUMN project_root TEXT DEFAULT NULL;'); } catch (e) {} // already exists on older DBs
     save();
     return _db;
   })();
@@ -50,6 +51,11 @@ function save() {
   if (!_db) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => fs.writeFileSync(DB_PATH, Buffer.from(_db.export())), 300);
+}
+function flushSync() {
+  if (!_db) return;
+  clearTimeout(saveTimer);
+  fs.writeFileSync(DB_PATH, Buffer.from(_db.export()));
 }
 
 function run(sql, params = []) { _db.run(sql, params); save(); }
@@ -72,11 +78,16 @@ function all(sql, params = []) {
 }
 
 module.exports = {
+  flushSync,
   init: getDb,
 
-  createConversation(id, model) {
-    run('INSERT INTO conversations (id, title, model) VALUES (?, \'New Chat\', ?)', [id, model || 'gpt-oss:120b-cloud']);
+  createConversation(id, model, projectRoot) {
+    run('INSERT INTO conversations (id, title, model, project_root) VALUES (?, \'New Chat\', ?, ?)', [id, model || 'gpt-oss:120b-cloud', projectRoot || null]);
     return this.getConversation(id);
+  },
+
+  updateConversationProjectRoot(id, projectRoot) {
+    run('UPDATE conversations SET project_root = ? WHERE id = ?', [projectRoot, id]);
   },
 
   getConversation(id) { return get('SELECT * FROM conversations WHERE id = ?', [id]); },
@@ -134,7 +145,7 @@ module.exports = {
   },
 
   getMessageHistory(conversationId) {
-    return all('SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC', [conversationId]);
+    return all("SELECT role, content FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC", [conversationId]);
   },
 
   // Delete a specific message and all messages after it (for edit/regenerate)

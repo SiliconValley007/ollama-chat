@@ -48,10 +48,12 @@ ollama pull nemotron-3-nano:30b-cloud
 ollama pull nemotron-3-super:cloud
 ollama pull nemotron-3-ultra:cloud
 ollama pull gemma4:31b-cloud
+ollama pull nomic-embed-text
 ```
 These run on Ollama's free cloud tier — they don't use your computer's
 GPU and download almost nothing (just a small pointer file), but you do
 need an internet connection every time you chat.
+Unlike the -cloud models above (which are just pointers to Ollama's hosted models and download almost nothing), nomic-embed-text is a small model that actually runs locally and downloads a real (~270MB) file — it powers the "📁 Open Project Folder" semantic code search (search_codebase), not chat.
 
 Confirm all six are installed:
 ```
@@ -125,6 +127,17 @@ git init
 git add .
 git commit -m "before AI edits"
 ```
+
+## Keeping semantic search up to date
+
+The project is indexed automatically the moment you open a folder, which
+is what powers the AI's `search_codebase` tool. If you then ask the AI
+(or edit files yourself) to add, remove, or significantly change files,
+click the small **🔄** button next to the file count in the sidebar to
+re-index — otherwise semantic search results may reflect the old
+version of the files. You don't need to click it after every single
+edit; it's only needed before you rely on `search_codebase` again after
+a batch of changes.
 
 ## Checking your real Ollama usage/quota
 

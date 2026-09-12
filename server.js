@@ -13,18 +13,29 @@ const codeIndex = require('./codeIndex');
 const activeTurns = new Map(); // conversationId -> { queue: [] }
 const pendingDiffs = new Map(); // pendingId -> { onDecision(approved), conversationId }
 const pendingCommands = new Map(); // pendingId -> { onDecision(approved), conversationId }
+const rateLimit = require('express-rate-limit');
+const log = {
+  _fmt: (lvl, args) => '[' + new Date().toISOString() + '] [' + lvl + '] ' + args.join(' '),
+  info: (...a) => console.log(log._fmt('INFO', a)),
+  warn: (...a) => console.warn(log._fmt('WARN', a)),
+  error: (...a) => console.error(log._fmt('ERROR', a)),
+};
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 const DEFAULT_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:120b-cloud';
 
 // ─── Runtime tuning (env-overridable, single source of truth) ────────────────
 const OLLAMA_NUM_CTX = parseInt(process.env.OLLAMA_NUM_CTX || '32768', 10);
 const OLLAMA_NUM_PREDICT = parseInt(process.env.OLLAMA_NUM_PREDICT || '4096', 10);
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '30m';
-// Leaves headroom under OLLAMA_NUM_CTX for the model's own reply. ~4 chars/token estimate.
-const TOOL_LOOP_CHAR_BUDGET = parseInt(process.env.TOOL_LOOP_CHAR_BUDGET || '90000', 10);
+// History and tool-loop content share ONE context window — split a single derived
+// budget between them instead of letting each claim its own full share, which could
+// sum to more than OLLAMA_NUM_CTX. ~3.5 chars/token conservative estimate for code.
+const CTX_CHAR_BUDGET = Math.floor((OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT) * 3.5);
+const TOOL_LOOP_CHAR_BUDGET = parseInt(process.env.TOOL_LOOP_CHAR_BUDGET || String(Math.floor(CTX_CHAR_BUDGET * 0.55)), 10);
+const MAX_HISTORY_CHARS = parseInt(process.env.MAX_HISTORY_CHARS || String(Math.floor(CTX_CHAR_BUDGET * 0.35)), 10);
 const REQUIRE_DIFF_APPROVAL = process.env.REQUIRE_DIFF_APPROVAL !== 'false'; // default ON
 const ENABLE_SHELL_TOOL = process.env.ENABLE_SHELL_TOOL !== 'false'; // default ON — gated by per-call approval
 const REQUIRE_COMMAND_APPROVAL = process.env.REQUIRE_COMMAND_APPROVAL !== 'false'; // default ON
@@ -33,6 +44,10 @@ const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 25 * 1024 * 1024,
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/api/', rateLimit({
+  windowMs: 60 * 1000,
+  max: 60
+}));
 
 // ─── Conversations ────────────────────────────────────────────────────────────
 
@@ -53,7 +68,7 @@ app.post('/api/conversations', (req, res) => {
   try {
     const id = uuidv4();
     const model = req.body.model || DEFAULT_MODEL;
-    res.json(db.createConversation(id, model));
+    res.json(db.createConversation(id, model, req.body.projectRoot || null));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -119,9 +134,15 @@ app.get('/api/conversations/:id/export', (req, res) => {
 
 // ─── Chat ─────────────────────────────────────────────────────────────────────
 app.post('/api/chat/steer', (req, res) => {
-  const turn = activeTurns.get(req.body.conversationId);
+  const conversationId = req.body.conversationId;
+  const turn = activeTurns.get(conversationId);
   if (!turn) return res.status(409).json({ error: 'No active turn for this conversation' });
-  turn.queue.push((req.body.note || '').trim());
+  const note = (req.body.note || '').trim();
+  if (!note) return res.json({ ok: true });
+  turn.queue.push(note);
+  const noteId = uuidv4();
+  db.addMessage(noteId, conversationId, 'steer', note);
+  if (turn.emit) turn.emit({ type: 'steer_note', id: noteId, note });
   res.json({ ok: true });
 });
 
@@ -151,6 +172,11 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   if (!conversationId || (!message && files.length === 0)) {
     return res.status(400).json({ error: 'conversationId and message or file required' });
   }
+  if (activeTurns.has(conversationId)) {
+    return res.status(409).json({ error: 'This conversation already has a message in flight from another tab or device. Wait for it to finish, or stop it, before sending another.' });
+  }
+  // Claim the slot before any `await` gives a concurrent request a window to pass the check too.
+  activeTurns.set(conversationId, { queue: [], aborted: false });
 
   let conversation = db.getConversation(conversationId);
   if (!conversation) {
@@ -172,15 +198,15 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       if (mime.startsWith('image/')) {
         content_parts.push({ type: 'text', text: '[Image rejected: ' + name + ' — no available model supports image understanding]' });
         storage_lines.push('[Image rejected: ' + name + ']');
-        console.log('[file] image rejected (unsupported):', name);
+        log.info('[file] image rejected (unsupported):', name);
       } else if (mime === 'application/pdf') {
         const buffer = fs.readFileSync(file.path);
         let pdfText = '';
         try {
           const parsed = await pdfParse(buffer);
           pdfText = (parsed.text || '').trim();
-          console.log('[file] PDF:', name, pdfText.length, 'chars');
-        } catch (e) { console.warn('[file] pdf-parse failed:', name, e.message); }
+          log.info('[file] PDF:', name, pdfText.length, 'chars');
+        } catch (e) { log.warn('[file] pdf-parse failed:', name, e.message); }
 
         if (pdfText.length > 30) {
           const truncated = pdfText.slice(0, 40000);
@@ -198,7 +224,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
         catch { try { textContent = fs.readFileSync(file.path, 'latin1').slice(0, 40000); } catch { textContent = '[Could not read]'; } }
         content_parts.push({ type: 'text', text: '<document filename="' + name + '">\n' + textContent + '\n</document>' });
         storage_lines.push('[File attached: ' + name + ']');
-        console.log('[file] text:', name);
+        log.info('[file] text:', name);
       }
     } catch (err) {
       content_parts.push({ type: 'text', text: '[Error reading: ' + name + ']' });
@@ -215,7 +241,12 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
 
   const rawHistory = db.getMessageHistory(conversationId);
 
-  const projectRoot = req.body.projectRoot && fs.existsSync(req.body.projectRoot) ? req.body.projectRoot : null;
+  const requestedProjectRoot = req.body.projectRoot && fs.existsSync(req.body.projectRoot) ? req.body.projectRoot : null;
+  const projectRoot = requestedProjectRoot || (conversation.project_root && fs.existsSync(conversation.project_root) ? conversation.project_root : null);
+  if (requestedProjectRoot && requestedProjectRoot !== conversation.project_root) {
+    db.updateConversationProjectRoot(conversationId, requestedProjectRoot);
+    conversation.project_root = requestedProjectRoot;
+  }
   let systemContent = 'You are a helpful AI coding assistant.';
   if (projectRoot) {
     const rules = loadProjectRules(projectRoot);
@@ -249,7 +280,6 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   // Always send as plain string — gpt-oss:120b-cloud does not accept array content
   const combinedContent = content_parts.map(p => p.text || '').join('\n').trim();
   historyForOllama.push({ role: 'user', content: combinedContent });
-  const MAX_HISTORY_CHARS = parseInt(process.env.MAX_HISTORY_CHARS || '80000', 10);
   historyForOllama = trimHistoryToBudget(historyForOllama, MAX_HISTORY_CHARS);
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -259,19 +289,22 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   res.flushHeaders();
 
   const assistantMsgId = uuidv4();
-  activeTurns.set(conversationId, { queue: [], aborted: false });
   let assistantContent = '';
   let finished = false;
   let userAborted = false;
   let lastEditedFiles = null;
   let ollamaReq;
-    res.on('close', () => {
+  res.on('close', () => {
     userAborted = true;
     if (!finished) ollamaReq?.destroy();
     const turn = activeTurns.get(conversationId);
-    if (turn) turn.aborted = true;
+    if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); }
     for (const [id, p] of pendingDiffs) if (p.conversationId === conversationId) { pendingDiffs.delete(id); p.onDecision(false); }
     for (const [id, p] of pendingCommands) if (p.conversationId === conversationId) { pendingCommands.delete(id); p.onDecision(false); }
+    // Save whatever partial reply had streamed in so far, and still set the
+    // conversation title — otherwise a stopped response vanishes on refresh
+    // and the chat stays named "New Chat" forever.
+    finish();
   });
 
   function finish() {
@@ -297,12 +330,14 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     if (projectRoot) {
     try {
       const emit = (evt) => { if (!res.writableEnded) res.write('data: ' + JSON.stringify(evt) + '\n\n'); };
+      const turnRef = activeTurns.get(conversationId);
+      if (turnRef) turnRef.emit = emit;
       let result, usedModel = conversation.model || DEFAULT_MODEL;
       const chain = [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)];
       let lastErr;
       for (const m of chain) {
         try { result = await resolveToolCalls(historyForOllama, projectRoot, m, conversationId, emit); usedModel = m; break; }
-        catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; console.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
+        catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
       }
       if (!result) throw lastErr || new Error('All models exhausted');
       if (usedModel !== conversation.model) db.updateConversationModel(conversationId, usedModel);
@@ -310,13 +345,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       assistantContent = result.content;
       lastEditedFiles = result.editedFiles && result.editedFiles.length ? result.editedFiles : null;
       res.write('data: ' + JSON.stringify({ usage: { promptTokens: result.promptTokens, evalTokens: result.evalTokens } }) + '\n\n');
-      const words = result.content.split(/(\s+)/);
-      let i = 0;
-      const iv = setInterval(() => {
-        if (userAborted || res.writableEnded) { clearInterval(iv); return; }
-        if (i >= words.length) { clearInterval(iv); finish(); return; }
-        res.write('data: ' + JSON.stringify({ token: words[i++] }) + '\n\n');
-      }, 12);
+      finish();
     } catch (err) {
       sendError('Project chat error: ' + err.message);
     }
@@ -336,7 +365,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
 
     const ollamaUrl = OLLAMA_HOST + '/api/chat';
     const payload = JSON.stringify({ model, messages: historyForOllama, stream: true, keep_alive: OLLAMA_KEEP_ALIVE, options: { num_ctx: OLLAMA_NUM_CTX, num_predict: OLLAMA_NUM_PREDICT } });
-    console.log('[chat] attempt', chainIdx + 1 + '/' + modelChain.length, '| model:', model, '| msgs:', historyForOllama.length, '| files:', files.length, '| payload:', Math.round(Buffer.byteLength(payload) / 1024) + 'KB');
+    log.info('[chat] attempt', chainIdx + 1 + '/' + modelChain.length, '| model:', model, '| msgs:', historyForOllama.length, '| files:', files.length, '| payload:', Math.round(Buffer.byteLength(payload) / 1024) + 'KB');
 
     const urlObj = new URL(ollamaUrl);
     const httpModule = urlObj.protocol === 'https:' ? require('https') : require('http');
@@ -348,14 +377,14 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
       timeout: 300000
     }, (ollamaRes) => {
-      console.log('[chat] Ollama status:', ollamaRes.statusCode, '| model:', model);
+      log.info('[chat] Ollama status:', ollamaRes.statusCode, '| model:', model);
       if (ollamaRes.statusCode !== 200) {
         let errBody = '';
         ollamaRes.on('data', c => errBody += c);
         ollamaRes.on('end', () => {
           const err = new Error('Ollama error ' + ollamaRes.statusCode + ': ' + errBody);
           if (isRetryableError(err) && chainIdx < modelChain.length - 1) {
-            console.warn('[fallback] ' + model + ' failed pre-stream (' + ollamaRes.statusCode + '), trying next model');
+            log.warn('[fallback] ' + model + ' failed pre-stream (' + ollamaRes.statusCode + '), trying next model');
             attemptStream(chainIdx + 1);
           } else {
             sendError(err.message);
@@ -400,13 +429,13 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     ollamaReq.on('timeout', () => {
       ollamaReq.destroy();
       if (!gotFirstByte && chainIdx < modelChain.length - 1) {
-        console.warn('[fallback] ' + model + ' timed out pre-stream, trying next model');
+        log.warn('[fallback] ' + model + ' timed out pre-stream, trying next model');
         attemptStream(chainIdx + 1);
       } else if (!finished) sendError('Request timed out.');
     });
     ollamaReq.on('error', err => {
       if (!gotFirstByte && isRetryableError(err) && chainIdx < modelChain.length - 1) {
-        console.warn('[fallback] ' + model + ' unreachable (' + err.message + '), trying next model');
+        log.warn('[fallback] ' + model + ' unreachable (' + err.message + '), trying next model');
         attemptStream(chainIdx + 1);
       } else if (!finished) sendError('Cannot connect to Ollama: ' + err.message);
     });
@@ -447,7 +476,7 @@ app.post('/api/preview-upload', previewUpload.single('file'), (req, res) => {
     setTimeout(() => pdfPreviews.delete(id), 10 * 60 * 1000);
     res.json({ id });
   } catch (err) {
-    console.error('[preview-upload] error:', err.message);
+    log.error('[preview-upload] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -471,7 +500,11 @@ app.get('/api/models', (req, res) => {
   const r = httpMod.get(OLLAMA_HOST + '/api/tags', ollamaRes => {
     ollamaRes.on('data', c => data += c);
     ollamaRes.on('end', () => {
-      try { res.json((JSON.parse(data).models || []).map(m => ({ name: m.name }))); }
+      try {
+        const models = (JSON.parse(data).models || [])
+          .filter(m => !m.name.startsWith('nomic-embed-text') && !/embed/i.test(m.name));
+        res.json(models.map(m => ({ name: m.name })));
+      }
       catch { res.json([]); }
     });
   });
@@ -645,14 +678,27 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
       messages.push({ role: 'user', content: '[Steering note from user — apply this now]: ' + notes });
     }
     enforceToolBudget(messages, TOOL_LOOP_CHAR_BUDGET);
-    const data = await ollamaChatOnce(messages, PROJECT_TOOLS, model);
+    let data;
+    try {
+      data = await ollamaChatStream(messages, PROJECT_TOOLS, model, conversationId, chunk => emit({ token: chunk }));
+    } catch (e) {
+      if (e && e.steered) {
+        emit({ type: 'stream_reset' });
+        if (e.partial) messages.push({ role: 'assistant', content: e.partial });
+        messages.push({ role: 'user', content: '[Steering note from user — apply this now]: ' + e.note });
+        continue;
+      }
+      throw e;
+    }
     totalPromptTokens += data.prompt_eval_count || 0;
     totalEvalTokens += data.eval_count || 0;
     const msg = data.message || {};
     if (!msg.tool_calls || !msg.tool_calls.length) {
       return { content: msg.content || '', promptTokens: totalPromptTokens, evalTokens: totalEvalTokens, editedFiles: [...editedFiles] };
     }
+    emit({ type: 'stream_reset' });
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
+    let touchedFiles = false;
     for (const call of msg.tool_calls) {
       const args = call.function.arguments || {};
       let result;
@@ -666,10 +712,10 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
           readCache.set(cacheKey, true);
         } else if (call.function.name === 'write_file') {
           result = await stageFileChange(projectRoot, args.path, { isEdit: false, content: args.content }, emit, conversationId);
-          if (!result.startsWith('Error') && !result.startsWith('Change to')) editedFiles.add(args.path);
+          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; }
         } else if (call.function.name === 'edit_file') {
           result = await stageFileChange(projectRoot, args.path, { isEdit: true, oldStr: args.old_str, newStr: args.new_str }, emit, conversationId);
-          if (!result.startsWith('Error') && !result.startsWith('Change to')) editedFiles.add(args.path);
+          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; }
         } else if (call.function.name === 'execute_command') {
           result = await stageCommandExecution(projectRoot, args.command, emit, conversationId);
         } else if (call.function.name === 'search_codebase') {
@@ -681,6 +727,7 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
       emit({ type: 'tool_end', callId, tool: call.function.name, ms: Date.now() - startedAt, ok: !result.startsWith('Error'), preview: (result || '').slice(0, 300) });
       messages.push({ role: 'tool', content: result });
     }
+    if (touchedFiles) codeIndex.buildIndex(projectRoot).catch(() => {}); // fire-and-forget, now the edits are actually on disk
   }
   return {
     content: '[Read/edited files but hit the ' + MAX_TOOL_CALLS + '-call limit. Ask about a narrower part of the project.]',
@@ -751,16 +798,56 @@ const PROJECT_TOOLS = [
   }
 ];
 
-function ollamaChatOnce(messages, tools, model) {
+// Streams one Ollama turn live. Resolves { message:{content,tool_calls}, prompt_eval_count, eval_count }.
+// Forwards content deltas to onToken() as they arrive (no more fake post-hoc typing).
+// If the user steers mid-stream, aborts and rejects with {steered:true, note, partial} so the
+// caller can fold the note in and re-issue generation — this is what makes steering real.
+function ollamaChatStream(messages, tools, model, conversationId, onToken) {
   return new Promise((resolve, reject) => {
-        const payload = JSON.stringify({ model, messages, tools, stream: false, keep_alive: OLLAMA_KEEP_ALIVE, options: { num_ctx: OLLAMA_NUM_CTX, num_predict: OLLAMA_NUM_PREDICT } });
+    const payload = JSON.stringify({ model, messages, tools, stream: true, keep_alive: OLLAMA_KEEP_ALIVE, options: { num_ctx: OLLAMA_NUM_CTX, num_predict: OLLAMA_NUM_PREDICT } });
     const u = new URL(OLLAMA_HOST + '/api/chat');
     const mod = u.protocol === 'https:' ? require('https') : require('http');
+    let content = '', toolCalls = null, promptTokens = 0, evalTokens = 0, buf = '', steered = false;
+    const checkSteer = () => {
+      if (steered) return;
+      const turn = activeTurns.get(conversationId);
+      if (turn && turn.queue.length) {
+        steered = true;
+        clearInterval(steerPoll);
+        const note = turn.queue.splice(0).join('\n');
+        r.destroy();
+        reject({ steered: true, note, partial: content });
+      }
+    };
+    // Don't rely solely on data-chunk arrival — Ollama can batch many tokens into
+    // one chunk, which previously made steering land only if you got lucky with
+    // network timing. Poll independently every 150ms so it's consistent regardless.
+    const steerPoll = setInterval(checkSteer, 150);
     const r = mod.request({ hostname: u.hostname, port: u.port || (u.protocol==='https:'?443:80),
       path: u.pathname, method: 'POST',
-      headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}, timeout: 120000
-    }, res => { let body=''; res.on('data', c=>body+=c); res.on('end', () => { try { resolve(JSON.parse(body)); } catch(e){ reject(e); } }); });
-    r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('Ollama timeout')); });
+      headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}, timeout: 300000
+    }, res => {
+      res.on('data', chunk => {
+        buf += chunk.toString('utf8');
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t) continue;
+          let data; try { data = JSON.parse(t); } catch { continue; }
+          if (data.message && data.message.tool_calls && data.message.tool_calls.length) toolCalls = data.message.tool_calls;
+          if (data.message && data.message.content) { content += data.message.content; onToken(data.message.content); }
+          if (data.done) { promptTokens = data.prompt_eval_count || 0; evalTokens = data.eval_count || 0; }
+        }
+        checkSteer();
+      });
+      res.on('end', () => { clearInterval(steerPoll); if (!steered) resolve({ message: { content, tool_calls: toolCalls }, prompt_eval_count: promptTokens, eval_count: evalTokens }); });
+      res.on('error', err => { clearInterval(steerPoll); if (!steered) reject(err); });
+    });
+    r.on('error', err => { clearInterval(steerPoll); if (!steered) reject(err); });
+    r.on('timeout', () => { r.destroy(); clearInterval(steerPoll); if (!steered) reject(new Error('Ollama timeout')); });
+    const turn = activeTurns.get(conversationId);
+    if (turn) turn.activeRequest = r;
     r.write(payload); r.end();
   });
 }
@@ -790,7 +877,7 @@ app.post('/api/project/index', (req, res) => {
   if (!folderPath || !fs.existsSync(folderPath)) return res.status(400).json({ error: 'Invalid path' });
   const current = codeIndex.getStatus(folderPath);
   if (current.status === 'running') return res.json({ status: 'running', ...current });
-  codeIndex.buildIndex(folderPath).catch(e => console.error('[codeIndex] build failed:', e.message));
+  codeIndex.buildIndex(folderPath).catch(e => log.error('[codeIndex] build failed:', e.message));
   res.json({ status: 'started' });
 });
 
@@ -808,13 +895,36 @@ function toolSearchCodebase(root, query, topK) {
 
 app.get('/api/project/file', (req, res) => {
   try {
+    if (!req.query.root) {
+      return res.status(400).json({ error: 'root is required' });
+    }
+    if (!req.query.path) {
+      return res.status(400).json({ error: 'path is required' });
+    }
+
+    const root = path.resolve(req.query.root);
     const p = path.resolve(req.query.path);
-    const root = path.resolve(req.query.root || '');
-    if (!root || !p.startsWith(root + path.sep)) {
+
+    if (!(p === root || p.startsWith(root + path.sep))) {
       return res.status(403).json({ error: 'Path outside opened project root' });
     }
-    res.json({ content: fs.readFileSync(p, 'utf8').slice(0, 100000) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    if (!fs.existsSync(p)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    let content;
+    try {
+      content = fs.readFileSync(p, 'utf8');
+    } catch {
+      return res.status(400).json({ error: 'File not readable as text' });
+    }
+
+    res.json({ content: content.slice(0, 100000) });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Health ───────────────────────────────────────────────────────────────────
@@ -822,6 +932,14 @@ app.get('/api/project/file', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST });
 });
+
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [id, p] of pdfPreviews) {
+    if (p.expires < now) pdfPreviews.delete(id);
+  }
+}, 60000);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -853,9 +971,22 @@ function trimHistoryToBudget(history, maxChars) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 db.init().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('Claude Chat running at http://0.0.0.0:' + PORT);
-    console.log('Ollama endpoint: ' + OLLAMA_HOST);
-    console.log('Default model: ' + DEFAULT_MODEL);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    log.info('Claude Chat running at http://0.0.0.0:' + PORT);
+    log.info('Ollama endpoint: ' + OLLAMA_HOST);
+    log.info('Default model: ' + DEFAULT_MODEL);
+
+    let shuttingDown = false;
+    function shutdown() {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log.info('Shutting down: closing active streams and flushing database...');
+      for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); }
+      try { db.flushSync(); } catch (e) { log.error('DB flush failed:', e.message); }
+      server.close(() => { log.info('Shutdown complete.'); process.exit(0); });
+      setTimeout(() => process.exit(0), 2000); // force-exit if something hangs
+    }
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   });
-}).catch(err => { console.error('Database init failed:', err); process.exit(1); });
+}).catch(err => { log.error('Database init failed:', err.message); process.exit(1); });
