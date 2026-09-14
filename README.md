@@ -37,9 +37,15 @@ Ollama runs the AI models.
    ollama --version
    ```
 
-## 3. Download the free AI models
+## 3. Sign in to Ollama, then download the free AI models
 
-Open a terminal and run each of these one at a time (each may take a
+Cloud models require you to be signed in, or every pull/chat below will
+fail with "You need to be signed in to Ollama to run Cloud models."
+Run this first and complete the sign-in in your browser:
+```
+ollama signin
+```
+Then open a terminal and run each of these one at a time (each may take a
 minute):
 ```
 ollama pull gpt-oss:120b-cloud
@@ -55,11 +61,11 @@ GPU and download almost nothing (just a small pointer file), but you do
 need an internet connection every time you chat.
 Unlike the -cloud models above (which are just pointers to Ollama's hosted models and download almost nothing), nomic-embed-text is a small model that actually runs locally and downloads a real (~270MB) file — it powers the "📁 Open Project Folder" semantic code search (search_codebase), not chat.
 
-Confirm all six are installed:
+Confirm all seven are installed:
 ```
 ollama list
 ```
-You should see all six names listed.
+You should see all seven names listed.
 
 > **Model names may change.** If any `pull` command fails, run
 > `ollama search gpt-oss` (or `nemotron`, `gemma`) to find the current
@@ -88,6 +94,14 @@ couple minutes).
 
 ## 6. Start the app
 
+The server requires an `APP_TOKEN` to be set — it will refuse to start
+without it. **Windows:** `start.bat` generates one for you automatically.
+**Mac/Linux:** set it yourself before starting:
+```
+export APP_TOKEN=$(openssl rand -hex 16)
+echo "Your token: $APP_TOKEN"   # copy this for step 7
+````
+
 **Windows:** double-click `start.bat`.
 
 **Mac/Linux, or if `start.bat` doesn't work:** in the terminal, run:
@@ -104,13 +118,29 @@ Default model: gpt-oss:120b-cloud
 
 ## 7. Open the app
 
-Open your web browser and go to:
-```
-http://localhost:3000
-```
+Open your web browser and go to (replace `<token>` with your `APP_TOKEN`
+value — check `.app_token` on Windows, or what you set with `export` on
+Mac/Linux):
+http://localhost:3000/?token=<token>
+Only needed the first time — the token is cached in your browser after
+that.
 You're chatting with a free Ollama Cloud model.
 
 ---
+
+## Accessing from your phone (Tailscale)
+
+`start.bat` prints a Tailscale URL (e.g. `http://100.x.x.x:3000`). This is
+a different address than `localhost`, so your browser won't have the
+token cached — open it once as `http://100.x.x.x:3000/?token=<token>`
+(same token from `.app_token`/step 6) to authorize that device too.
+
+> **⚠️ Security note:** anyone holding this token can read/write any file
+> on this machine and run arbitrary shell commands via the agent's
+> `execute_command`/`write_file` tools (gated only by an in-chat
+> approve/reject prompt). Only share the token over Tailscale with
+> devices you trust, and never expose this server's port to the public
+> internet.
 
 ## Using the "Open Project Folder" feature (Cursor-style)
 
@@ -163,5 +193,6 @@ without interruption.
   confirm the exact model name matches what's shown in the app's model
   switcher (top right).
 - **Port 3000 already in use** → close whatever else is using it, or
-  run `set PORT=3001 && node server.js` (Windows) / `PORT=3001 node
-  server.js` (Mac/Linux) and open `http://localhost:3001` instead.
+   run `$env:PORT=3001; node server.js` (Windows PowerShell) / `set PORT=3001&&node server.js`
+  (Windows CMD) / `PORT=3001 node server.js` (Mac/Linux) and open `http://localhost:3001/?token=<token>` instead.
+- **"Unauthorized" / 401 errors** → your URL is missing `?token=<token>`, or you're using an old cached token after regenerating `.app_token`/re-exporting `APP_TOKEN`. Clear it with `localStorage.removeItem("app_token")` in the browser console, then reopen with the correct `?token=`.

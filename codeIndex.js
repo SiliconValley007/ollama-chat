@@ -5,8 +5,14 @@ const crypto = require('crypto');
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 const CHUNK_LINES = 60;
 const CHUNK_OVERLAP = 10;
-const IGNORE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.lock', '.db', '.zip', '.gz', '.mp4']);
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db']);
+const ALLOWED_EXT = new Set([
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.kts',
+  '.c', '.h', '.cpp', '.hpp', '.cs', '.go', '.rs', '.rb', '.php', '.swift',
+  '.html', '.css', '.scss', '.less', '.json', '.yaml', '.yml', '.xml',
+  '.md', '.txt', '.sh', '.bat', '.sql', '.gradle', '.properties', '.env'
+]);
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db', 'music', 'output', 'gradle', '.gradle']);
+const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_[re]?[cd]sa.*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
 
 function normRoot(root) {
   let r = path.resolve(root);
@@ -21,13 +27,22 @@ function indexPathFor(root) {
   return path.join(dir, hash + '.json');
 }
 
-function listFiles(dir, base = dir, out = []) {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+function listFiles(dir, base = dir, out = [], seen = new Set()) {
+  let entries, real;
+  try { real = fs.realpathSync(dir); } catch { return out; }
+  if (seen.has(real)) return out; // symlink cycle — stop instead of recursing forever
+  seen.add(real);
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return out; } // permission-denied/broken dir — skip, don't fail the whole build
+  for (const e of entries) {
     if (e.name.startsWith('.') || IGNORE_DIRS.has(e.name)) continue;
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) { listFiles(full, base, out); continue; }
-    if (IGNORE_EXT.has(path.extname(e.name).toLowerCase())) continue;
-    out.push(path.relative(base, full).split(path.sep).join('/'));
+    if (e.isDirectory()) { listFiles(full, base, out, seen); continue; }
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ALLOWED_EXT.has(ext)) continue;
+    const rel = path.relative(base, full).split(path.sep).join('/');
+    if (SENSITIVE_FILE_RX.test(rel)) continue; // never embed/leak secret-pattern files to a cloud model
+    out.push(rel);
   }
   return out;
 }
@@ -45,13 +60,18 @@ function chunkFile(content) {
 }
 
 async function embed(text) {
-  const r = await fetch((process.env.OLLAMA_HOST || 'http://localhost:11434') + '/api/embeddings', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 8000) })
-  });
-  if (!r.ok) throw new Error('Embedding request failed: ' + r.status);
-  const data = await r.json();
-  return data.embedding;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 30000);
+  try {
+    const r = await fetch((process.env.OLLAMA_HOST || 'http://localhost:11434') + '/api/embeddings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 8000) }),
+      signal: controller.signal
+    });
+    if (!r.ok) throw new Error('Embedding request failed: ' + r.status);
+    const data = await r.json();
+    return data.embedding;
+  } finally { clearTimeout(t); }
 }
 
 function cosineSim(a, b) {
@@ -64,6 +84,7 @@ const buildStatus = new Map(); // root -> { status, total, done }
 
 async function buildIndex(root) {
   const key = normRoot(root);
+  if (buildStatus.get(key)?.status === 'running') return; // prevent overlapping builds racing on the same index file
   buildStatus.set(key, { status: 'running', total: 0, done: 0 });
   try {
     const files = listFiles(root);
@@ -71,7 +92,9 @@ async function buildIndex(root) {
     let totalChunks = 0;
     const perFileChunks = files.map(f => {
       try {
-        const content = fs.readFileSync(path.join(root, f), 'utf8');
+        const full = path.join(root, f);
+        if (fs.statSync(full).size > 500 * 1024) return { f, chunks: [] };
+        const content = fs.readFileSync(full, 'utf8');
         const chunks = chunkFile(content);
         totalChunks += chunks.length;
         return { f, chunks };

@@ -14,6 +14,7 @@
     />
     <meta name="apple-mobile-web-app-title" content="Claude Chat" />
     <link rel="manifest" href="/manifest.json" />
+    <link rel="stylesheet" href="/vendor/highlight.css">
     <link
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%239b4dff'/><text y='.9em' font-size='72' x='12'>✦</text></svg>"
@@ -24,8 +25,8 @@
       href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+    <script src="/vendor/marked.min.js"></script>
+    <script src="/vendor/purify.min.js"></script>
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
@@ -37,7 +38,7 @@
       id="hljs-theme-light"
       disabled
     />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="/vendor/highlight.min.js"></script>
     <style>
       :root {
         --bg: #0d0d0f;
@@ -527,6 +528,20 @@
       @keyframes tool-spin { to { transform: rotate(360deg); } }
       .tool-activity-ok { color: var(--text2); }
       .tool-activity-err { color: #e5484d; }
+      .status-line {
+        display: flex; align-items: center; gap: 8px; cursor: pointer;
+        font-size: 12.5px; color: var(--text3); margin: 4px 0 4px 40px;
+        font-family: var(--font-mono, monospace);
+      }
+      .status-spinner {
+        width: 10px; height: 10px; border-radius: 50%;
+        border: 2px solid var(--border2); border-top-color: var(--accent, #888);
+        animation: tool-spin 0.7s linear infinite; flex-shrink: 0;
+      }
+      .status-line.status-done .status-spinner { animation: none; border-top-color: var(--border2); }
+      .status-timer { color: var(--text3); opacity: 0.7; }
+      .status-chevron { opacity: 0.6; }
+      .status-detail { margin: 2px 0 4px 40px; }
 
       .diff-card {
         margin: 8px 0 8px 40px; border: 1px solid var(--border2); border-radius: 10px;
@@ -1787,7 +1802,20 @@
       // ── Health & Models ───────────────────────────────────────────────────────────
       async function checkHealth() {
         try {
+          let APP_TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("app_token") || "";
+          if (!APP_TOKEN) { APP_TOKEN = prompt("Enter your APP_TOKEN (see .app_token file):") || ""; }
+          if (APP_TOKEN) localStorage.setItem("app_token", APP_TOKEN);
+          if (!window.__fetchPatched) {
+            window.__fetchPatched = true;
+            const nativeFetch = window.fetch.bind(window);
+            window.fetch = (url, opts = {}) => {
+              opts.headers = { ...(opts.headers || {}), "x-app-token": window.__APP_TOKEN || "" };
+              return nativeFetch(url, opts);
+            };
+          }
+          window.__APP_TOKEN = APP_TOKEN;
           const r = await fetch("/api/health");
+          if (!r.ok) { throw new Error("Token not found"); }
           await r.json();
           setStatus("online");
           loadModels();
@@ -1800,6 +1828,7 @@
       async function loadModels() {
         try {
           const r = await fetch("/api/models");
+          if (!r.ok) { throw new Error("Failed to load models"); }
           availableModels = await r.json();
           renderModelDropdown();
         } catch {}
@@ -2171,6 +2200,7 @@
           .join("");
         try {
           const r = await fetch("/api/conversations");
+          if (!r.ok) { throw new Error("Token not found"); }
           const convs = await r.json();
           renderConversationList(convs, false);
         } catch {
@@ -2305,6 +2335,8 @@
         try {
           const r = await fetch("/api/conversations/" + id);
           const data = await r.json();
+          const rawEvents = await fetch("/api/conversations/" + id + "/events")
+            .then((er) => er.json()).catch(() => []);
           currentConvId = id;
           currentModel = data.model || currentModel;
           document.getElementById("model-badge").textContent = currentModel;
@@ -2329,7 +2361,7 @@
           document.getElementById("conv-title-display").textContent =
             data.title;
           document.getElementById("export-btn").style.display = "flex";
-          renderMessages(data.messages);
+          renderMessages(data.messages, rawEvents);
           closeSidebar();
         } catch {
           showToast("Failed to load conversation");
@@ -2342,7 +2374,7 @@
           .forEach((el) => el.classList.toggle("active", el.dataset.id === id));
       }
 
-      function renderMessages(messages) {
+      function renderMessages(messages, rawEvents) {
         const inner = document.getElementById("messages-inner");
         inner.innerHTML = "";
         lastAssistantMsgId = null;
@@ -2351,9 +2383,26 @@
           inner.innerHTML = getWelcomeHTML();
           return;
         }
-        messages.forEach((m) => {
-          if (m.role === "steer") { renderSteerNote(inner, m.content); return; }
-          appendMessage(m.role, m.content, false, m.id, m.created_at);
+        // Merge stored tool_start/tool_end events back into the timeline so a
+        // reopened chat shows the same read/edit/search trace the live stream did.
+        const toolEvents = (rawEvents || [])
+          .filter((e) => e.type === "tool_start" || e.type === "tool_end")
+          .map((e) => {
+            try { return { at: e.created_at, payload: JSON.parse(e.payload) }; }
+            catch { return null; }
+          })
+          .filter(Boolean);
+        const timeline = [
+          ...messages.map((m) => ({ at: m.created_at, kind: "message", m })),
+          ...toolEvents.map((e) => ({ at: e.at, kind: "event", payload: e.payload })),
+        ].sort((a, b) => a.at - b.at);
+        timeline.forEach((item) => {
+          if (item.kind === "message") {
+            if (item.m.role === "steer") { renderSteerNote(inner, item.m.content); return; }
+            appendMessage(item.m.role, item.m.content, false, item.m.id, item.m.created_at);
+          } else {
+            renderToolActivity(inner, item.payload);
+          }
         });
         scrollToBottom();
         setTimeout(() => {
@@ -3053,11 +3102,38 @@
         const typingEl = appendTypingIndicator();
         setStreaming(true);
 
+        const statusWrap = document.createElement("div");
+        statusWrap.className = "status-line";
+        statusWrap.innerHTML =
+          '<span class="status-spinner"></span>' +
+          '<span class="status-text">Working…</span>' +
+          '<span class="status-timer">0s</span>' +
+          '<span class="status-chevron">▾</span>';
+        const statusDetail = document.createElement("div");
+        statusDetail.className = "status-detail";
+        statusDetail.style.display = "none";
+        statusWrap.onclick = () =>
+          (statusDetail.style.display = statusDetail.style.display === "none" ? "block" : "none");
+        inner.appendChild(statusWrap);
+        inner.appendChild(statusDetail);
+        const turnStartedAt = Date.now();
+        const statusTimerInt = setInterval(() => {
+          statusWrap.querySelector(".status-timer").textContent =
+            Math.round((Date.now() - turnStartedAt) / 1000) + "s";
+        }, 1000);
+
         let buffer = "";
         let streamWrapper = null;
         let streamBubble = null;
         let newMsgId = null;
         abortController = new AbortController();
+        let lastEventAt = Date.now();
+        const stallTimer = setInterval(() => {
+          if (Date.now() - lastEventAt > 15000) {
+            statusWrap.querySelector(".status-text").textContent = "⚠ No update for 15s — may be stuck";
+            clearInterval(stallTimer);
+          }
+        }, 5000);
 
         try {
           const response = await fetch("/api/chat", {
@@ -3070,6 +3146,7 @@
             try { msg = (await response.json()).error || msg; } catch {}
             if (typingEl.parentNode) typingEl.remove();
             appendErrorMessage(msg, () => sendMessage(overrideText));
+            clearInterval(stallTimer);
             setStreaming(false);
             return;
           }
@@ -3095,7 +3172,14 @@
                 }
                 if (data.type === "tool_start" || data.type === "tool_end") {
                   if (typingEl.parentNode) typingEl.remove();
-                  renderToolActivity(inner, data);
+                  lastEventAt = Date.now();
+                  if (data.type === "tool_start") {
+                    const label = { read_file: "Reading", write_file: "Writing", edit_file: "Editing",
+                      execute_command: "Running", search_codebase: "Searching" }[data.tool] || data.tool;
+                    const detail = (data.args && (data.args.path || data.args.command || data.args.query)) || "";
+                    statusWrap.querySelector(".status-text").textContent = label + (detail ? " " + detail : "") + "…";
+                  }
+                  renderToolActivity(statusDetail, data);
                   scrollToBottomIfNearBottom();
                   continue;
                 }
@@ -3133,6 +3217,8 @@
                   continue;
                 }
                 if (data.token) {
+                  lastEventAt = Date.now();
+                  statusWrap.querySelector(".status-text").textContent = "Writing response…";
                   if (!streamWrapper) {
                     if (typingEl.parentNode) typingEl.remove();
                     streamWrapper = document.createElement("div");
@@ -3164,6 +3250,11 @@
                       "')\">🔄 Regenerate</button>";
                     lastAssistantMsgId = newMsgId;
                   }
+                  clearInterval(stallTimer);
+                  clearInterval(statusTimerInt);
+                  statusWrap.classList.add("status-done");
+                  statusWrap.querySelector(".status-text").textContent =
+                    "Worked for " + statusWrap.querySelector(".status-timer").textContent;
                   setStreaming(false);
                   await loadConversations();
                   try {
@@ -3178,6 +3269,10 @@
             }
           }
         } catch (err) {
+          clearInterval(stallTimer);
+          clearInterval(statusTimerInt);
+          if (statusWrap.parentNode) statusWrap.remove();
+          if (statusDetail.parentNode) statusDetail.remove();
           if (err.name === "AbortError") {
             if (typingEl.parentNode) typingEl.remove();
             if (streamBubble) streamBubble.classList.remove("streaming-cursor");
@@ -3274,7 +3369,7 @@
             return;
           }
           const { id } = await r.json();
-          window.open("/api/preview/" + id, "_blank");
+          window.open("/api/preview/" + id + "?token=" + encodeURIComponent(localStorage.getItem("app_token") || ""), "_blank");
         } catch (e) {
           showToast("Failed to open PDF: " + e.message);
         }
@@ -3381,7 +3476,8 @@
           .replace(/&/g, "&amp;")
           .replace(/</g, "&lt;")
           .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
       }
       function formatDate(d) {
         const now = new Date(),

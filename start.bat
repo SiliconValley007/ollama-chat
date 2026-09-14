@@ -18,6 +18,12 @@ set OLLAMA_MODEL=gpt-oss:120b-cloud
 set PORT=3000
 set OLLAMA_HOST=http://localhost:11434
 
+:: Auth token shared between server and browser UI (required — server refuses to start without it)
+if not exist "%~dp0.app_token" (
+    for /f %%g in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')"') do >"%~dp0.app_token" echo|set /p="%%g"
+)
+set /p APP_TOKEN=<"%~dp0.app_token"
+
 :: Check Node.js
 where node >nul 2>&1
 if %errorlevel% neq 0 (

@@ -1,6 +1,6 @@
 // Service Worker for PWA — cache shell assets for offline
-const CACHE = 'claude-chat-v3';
-const SHELL = ['/', '/index.html', '/manifest.json'];
+const CACHE = 'claude-chat-v4';
+const SHELL = ['/', '/manifest.json', '/favicon.svg'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -17,5 +17,8 @@ self.addEventListener('fetch', e => {
     return;
   }
   // Other shell assets: cache first, fallback to network
-  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => {
+    if (res.ok) caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+    return res;
+  })));
 });

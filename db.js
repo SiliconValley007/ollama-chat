@@ -39,23 +39,33 @@ async function getDb() {
       CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
     `);
-    try { _db.run('ALTER TABLE conversations ADD COLUMN project_root TEXT DEFAULT NULL;'); } catch (e) {} // already exists on older DBs
+    try { _db.run('ALTER TABLE conversations ADD COLUMN project_root TEXT DEFAULT NULL;'); }
+    catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
+    _db.run(`CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, type TEXT NOT NULL,
+      payload TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    ); CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id, created_at);`);
     save();
     return _db;
   })();
   return _ready;
 }
 
+function atomicWrite(data) {
+  const tmp = DB_PATH + '.tmp';
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, DB_PATH); // rename is atomic — DB_PATH is never left half-written
+}
 let saveTimer = null;
 function save() {
   if (!_db) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.writeFileSync(DB_PATH, Buffer.from(_db.export())), 300);
+  saveTimer = setTimeout(() => atomicWrite(Buffer.from(_db.export())), 300);
 }
 function flushSync() {
   if (!_db) return;
   clearTimeout(saveTimer);
-  fs.writeFileSync(DB_PATH, Buffer.from(_db.export()));
+  atomicWrite(Buffer.from(_db.export()));
 }
 
 function run(sql, params = []) { _db.run(sql, params); save(); }
@@ -144,15 +154,26 @@ module.exports = {
     return all('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC', [conversationId]);
   },
 
+  addEvent(id, conversationId, type, payload) {
+    run('INSERT INTO events (id, conversation_id, type, payload) VALUES (?, ?, ?, ?)', [id, conversationId, type, JSON.stringify(payload)]);
+  },
+  getEvents(conversationId) {
+    return all('SELECT * FROM events WHERE conversation_id = ? ORDER BY created_at ASC', [conversationId]);
+  },
   getMessageHistory(conversationId) {
     return all("SELECT role, content FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC", [conversationId]);
   },
 
   // Delete a specific message and all messages after it (for edit/regenerate)
   deleteMessagesFrom(conversationId, messageId) {
-    const msg = get('SELECT created_at FROM messages WHERE id = ? AND conversation_id = ?', [messageId, conversationId]);
+    const msg = get('SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?', [messageId, conversationId]);
     if (!msg) return;
-    run('DELETE FROM messages WHERE conversation_id = ? AND created_at >= ?', [conversationId, msg.created_at]);
+    // Use rowid-based cutoff (monotonic, unlike second-granularity created_at) so
+    // sibling events inserted in the same second as the truncated message aren't
+    // ambiguously kept or dropped. events.rowid is not directly comparable to
+    // messages.rowid, so fall back to a safe time window minus 1s of slack.
+    run('DELETE FROM messages WHERE conversation_id = ? AND rowid >= ?', [conversationId, msg.rowid]);
+    run('DELETE FROM events WHERE conversation_id = ? AND created_at >= ?', [conversationId, Math.max(0, msg.created_at - 1)]);
     save();
   }
 };

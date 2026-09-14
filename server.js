@@ -20,6 +20,8 @@ const log = {
   warn: (...a) => console.warn(log._fmt('WARN', a)),
   error: (...a) => console.error(log._fmt('ERROR', a)),
 };
+process.on('unhandledRejection', (e) => { log.error('[unhandledRejection]', e && e.message || String(e)); try { require('./db').flushSync(); } catch {} });
+process.on('uncaughtException', (e) => { log.error('[uncaughtException]', e && e.message || String(e)); try { require('./db').flushSync(); } catch {} process.exit(1); });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,8 +29,16 @@ const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 const DEFAULT_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:120b-cloud';
 
 // ─── Runtime tuning (env-overridable, single source of truth) ────────────────
-const OLLAMA_NUM_CTX = parseInt(process.env.OLLAMA_NUM_CTX || '32768', 10);
-const OLLAMA_NUM_PREDICT = parseInt(process.env.OLLAMA_NUM_PREDICT || '4096', 10);
+function intEnv(name, fallback) {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+let OLLAMA_NUM_CTX = intEnv('OLLAMA_NUM_CTX', 32768);
+let OLLAMA_NUM_PREDICT = intEnv('OLLAMA_NUM_PREDICT', 4096);
+if (OLLAMA_NUM_PREDICT >= OLLAMA_NUM_CTX) {
+  log.error('OLLAMA_NUM_PREDICT (' + OLLAMA_NUM_PREDICT + ') must be less than OLLAMA_NUM_CTX (' + OLLAMA_NUM_CTX + ') — falling back to defaults.');
+  OLLAMA_NUM_CTX = 32768; OLLAMA_NUM_PREDICT = 4096;
+}
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '30m';
 // History and tool-loop content share ONE context window — split a single derived
 // budget between them instead of letting each claim its own full share, which could
@@ -40,13 +50,27 @@ const REQUIRE_DIFF_APPROVAL = process.env.REQUIRE_DIFF_APPROVAL !== 'false'; // 
 const ENABLE_SHELL_TOOL = process.env.ENABLE_SHELL_TOOL !== 'false'; // default ON — gated by per-call approval
 const REQUIRE_COMMAND_APPROVAL = process.env.REQUIRE_COMMAND_APPROVAL !== 'false'; // default ON
 
-const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 25 * 1024 * 1024, files: 10 } });
+const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 25 * 1024 * 1024, files: 10, fieldSize: 5 * 1024 * 1024 } });
 
+const SHARED_TOKEN = process.env.APP_TOKEN;
+if (!SHARED_TOKEN) { log.error('APP_TOKEN env var is required — refusing to start without auth.'); process.exit(1); }
+const PUBLIC_ASSETS = new Set(['/', '/index.html', '/sw.js', '/manifest.json', '/favicon.svg', '/icon-192.png', '/icon-192.svg', '/icon-512.png', '/icon-512.svg']);
+// NOTE: all /api/* routes remain behind the token check below — only the HTML shell is public now.
+app.use((req, res, next) => {
+  if (req.path.startsWith('/vendor')) return next(); // ✅ allow static
+  if (PUBLIC_ASSETS.has(req.path)) return next();
+  const supplied = String(req.headers['x-app-token'] || req.query.token || '');
+  const expected = Buffer.from(SHARED_TOKEN);
+  const given = Buffer.from(supplied);
+  const ok = given.length === expected.length && require('crypto').timingSafeEqual(given, expected);
+  if (!ok) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+});
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/api/', rateLimit({
   windowMs: 60 * 1000,
-  max: 60
+  max: parseInt(process.env.API_RATE_LIMIT || '300', 10)
 }));
 
 // ─── Conversations ────────────────────────────────────────────────────────────
@@ -137,6 +161,7 @@ app.post('/api/chat/steer', (req, res) => {
   const conversationId = req.body.conversationId;
   const turn = activeTurns.get(conversationId);
   if (!turn) return res.status(409).json({ error: 'No active turn for this conversation' });
+  if (!turn.emit) return res.status(409).json({ error: 'Steering is only supported for project (agentic) turns.' });
   const note = (req.body.note || '').trim();
   if (!note) return res.json({ ok: true });
   turn.queue.push(note);
@@ -271,6 +296,11 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     }
     if (rules) systemContent += '\n\n--- Project rules (' + rules.file + ') — follow these strictly ---\n' + rules.content;
   }
+  // System prompt was previously uncounted against the context budget — cap it and
+  // deduct its size so history + system never exceed the intended total.
+  const SYSTEM_PROMPT_CAP = Math.floor(CTX_CHAR_BUDGET * 0.20);
+  if (systemContent.length > SYSTEM_PROMPT_CAP) systemContent = systemContent.slice(0, SYSTEM_PROMPT_CAP) + '\n[...tree/rules truncated to fit context budget]';
+  const historyBudget = Math.max(1000, MAX_HISTORY_CHARS - systemContent.length);
   let historyForOllama = [{ role: 'system', content: systemContent }];
 
   for (let i = 0; i < rawHistory.length - 1; i++) {
@@ -278,9 +308,13 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   }
 
   // Always send as plain string — gpt-oss:120b-cloud does not accept array content
-  const combinedContent = content_parts.map(p => p.text || '').join('\n').trim();
+  let combinedContent = content_parts.map(p => p.text || '').join('\n').trim();
+  const CURRENT_TURN_CHAR_CAP = Math.floor(historyBudget * 0.9);
+  if (combinedContent.length > CURRENT_TURN_CHAR_CAP) {
+    combinedContent = combinedContent.slice(0, CURRENT_TURN_CHAR_CAP) + '\n[...truncated: attachments + message exceeded the context budget]';
+  }
   historyForOllama.push({ role: 'user', content: combinedContent });
-  historyForOllama = trimHistoryToBudget(historyForOllama, MAX_HISTORY_CHARS);
+  historyForOllama = trimHistoryToBudget(historyForOllama, historyBudget);
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -298,7 +332,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     userAborted = true;
     if (!finished) ollamaReq?.destroy();
     const turn = activeTurns.get(conversationId);
-    if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); }
+    if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); turn.activeChild?.kill('SIGTERM'); }
     for (const [id, p] of pendingDiffs) if (p.conversationId === conversationId) { pendingDiffs.delete(id); p.onDecision(false); }
     for (const [id, p] of pendingCommands) if (p.conversationId === conversationId) { pendingCommands.delete(id); p.onDecision(false); }
     // Save whatever partial reply had streamed in so far, and still set the
@@ -324,19 +358,27 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   }
 
   function sendError(msg) {
+    activeTurns.delete(conversationId);
     if (!res.writableEnded) { res.write('data: ' + JSON.stringify({ error: msg }) + '\n\n'); res.end(); }
   }
 
     if (projectRoot) {
     try {
-      const emit = (evt) => { if (!res.writableEnded) res.write('data: ' + JSON.stringify(evt) + '\n\n'); };
+      const emit = (evt) => {
+        // Accumulate as tokens stream so an abort mid tool-loop still has content
+        // to persist in finish(); clear on stream_reset since that content was discarded.
+        if (evt.token) assistantContent += evt.token;
+        if (evt.type === 'stream_reset') assistantContent = '';
+        if (evt.type) db.addEvent(uuidv4(), conversationId, evt.type, evt);
+        if (!res.writableEnded) res.write('data: ' + JSON.stringify(evt) + '\n\n');
+      };
       const turnRef = activeTurns.get(conversationId);
       if (turnRef) turnRef.emit = emit;
       let result, usedModel = conversation.model || DEFAULT_MODEL;
       const chain = [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)];
       let lastErr;
       for (const m of chain) {
-        try { result = await resolveToolCalls(historyForOllama, projectRoot, m, conversationId, emit); usedModel = m; break; }
+        try { result = await resolveToolCalls(historyForOllama.slice(), projectRoot, m, conversationId, emit); usedModel = m; break; }
         catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
       }
       if (!result) throw lastErr || new Error('All models exhausted');
@@ -536,10 +578,19 @@ function safeResolve(root, relPath) {
   const resolvedRoot = path.resolve(root);
   const p = path.resolve(resolvedRoot, relPath || '.');
   if (p !== resolvedRoot && !p.startsWith(resolvedRoot + path.sep)) throw new Error('Path outside project root');
+  let realRoot;
+  try { realRoot = fs.realpathSync(resolvedRoot); } catch { realRoot = resolvedRoot; }
+  // Realpath-check the nearest EXISTING ancestor, not just p itself — catches a
+  // symlinked intermediate directory even when the final component (a new file
+  // write_file is about to create) doesn't exist yet.
+  let probe = p;
+  while (!fs.existsSync(probe)) probe = path.dirname(probe);
+  const realProbe = fs.realpathSync(probe);
+  if (realProbe !== realRoot && !realProbe.startsWith(realRoot + path.sep)) throw new Error('Path outside project root (symlink)');
   return p;
 }
 
-const MAX_TOOL_CALLS = 40;
+const MAX_TOOL_CALLS = parseInt(process.env.MAX_TOOL_CALLS || '1000', 10);
 
 // Keeps the tool-result portion of the conversation under TOOL_LOOP_CHAR_BUDGET by
 // collapsing the oldest tool outputs first. Never touches system/user/assistant turns.
@@ -547,43 +598,62 @@ function enforceToolBudget(messages, budgetChars) {
   let total = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m.role !== 'tool') continue;
+    if (m.role !== 'tool' && m.role !== 'assistant' && !(m.role === 'user' && i > 0)) continue;
     total += (m.content || '').length;
-    if (total > budgetChars && !m.content.startsWith('[older tool output omitted')) {
-      m.content = '[older tool output omitted to save context — call the tool again if you need it]';
+    if (total > budgetChars) {
+      if (m.role === 'tool' && !m.content.startsWith('[older tool output omitted')) {
+        m.content = '[older tool output omitted to save context — call the tool again if you need it]';
+      } else if (m.role !== 'tool' && !m.content.startsWith('[older message omitted')) {
+        m.content = '[older message omitted to save context]';
+      }
     }
   }
 }
 
+const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_[re]?[cd]sa.*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
 function toolReadFile(root, relPath) {
-  return fs.readFileSync(safeResolve(root, relPath), 'utf8').slice(0, 10000);
+  if (SENSITIVE_FILE_RX.test(relPath)) return 'Error: reading this file is blocked (matches a secrets/key pattern) — this project sends file contents to a cloud-hosted model.';
+  const resolved = safeResolve(root, relPath);
+  const stat = fs.statSync(resolved);
+  if (stat.size > 20 * 1024 * 1024) return 'Error: file is ' + Math.round(stat.size/1024/1024) + 'MB — too large to read directly. Use execute_command (head/sed/grep) to inspect it in pieces.';
+  const full = fs.readFileSync(resolved, 'utf8');
+  if (full.length <= 10000) return full;
+  return full.slice(0, 10000) + '\n[...truncated — file is ' + full.length + ' chars, only first 10000 shown. Use execute_command (e.g. sed/grep) to inspect the rest before editing near the end.]';
 }
 
 // ─── Shell execution (opt-in via ENABLE_SHELL_TOOL=true) ─────────────────────
 const SHELL_BLOCKLIST = [
   /rm\s+-rf\s+\//i, /sudo\b/i, /mkfs/i, /dd\s+if=/i, /:\(\)\{.*\};:/,
-  /shutdown/i, /reboot/i, /curl[^\n]*\|\s*sh/i, /wget[^\n]*\|\s*sh/i,
-  />\s*\/dev\/sd/i, /chmod\s+-R\s+777\s+\//i
+  /shutdown/i, /reboot/i, /curl[^\n]*\|\s*(ba|z)?sh\b/i, /wget[^\n]*\|\s*(ba|z)?sh\b/i,
+  />\s*\/dev\/sd/i, /chmod\s+-R\s+777\s+\//i,
+  /format\s+[a-z]:/i, /del\s+\/[a-z]*s[a-z]*\s/i, /remove-item[^\n]*-recurse[^\n]*-force/i, /remove-item[^\n]*-force[^\n]*-recurse/i, /rd\s+\/s/i,
+  // Any rm/del/rmdir/remove-item/rd targeting a path that walks above cwd via ".."
+  /\b(rm|del|rmdir|remove-item|rd)\b[^\n]*\.\.(?:[\\/]|\s|$)/i
 ];
 
-function runShellCommand(root, command, settle) {
+function runShellCommand(root, command, settle, conversationId) {
   const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
   const shellFlag = process.platform === 'win32' ? '/c' : '-c';
-  execFile(shell, [shellFlag, command], { cwd: root, timeout: 60000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+  const child = execFile(shell, [shellFlag, command], { cwd: root, timeout: 60000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const t = activeTurns.get(conversationId);
+    if (t) t.activeChild = null;
     const out = (stdout || '').slice(0, 8000);
     const errOut = (stderr || '').slice(0, 4000);
-    if (err && err.killed) return settle('Command timed out after 60s.\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
+    if (err && err.killed) return settle('Command timed out or was cancelled.\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
     if (err) return settle('Exit code ' + err.code + '\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
     settle('Exit code 0\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
   });
+  const t = activeTurns.get(conversationId);
+  if (t) t.activeChild = child;
 }
 
 function stageCommandExecution(root, command, emit, conversationId) {
   return new Promise((settle) => {
     if (!ENABLE_SHELL_TOOL) return settle('Error: shell execution is disabled on this server.');
     if (!command || typeof command !== 'string') return settle('Error: command is required');
+    if (SENSITIVE_FILE_RX.test(command)) return settle('Error: command references a secrets/key file and is blocked — output would be sent to a cloud-hosted model.');
     if (SHELL_BLOCKLIST.some(rx => rx.test(command))) return settle('Error: command blocked by safety policy.');
-    if (!REQUIRE_COMMAND_APPROVAL) return runShellCommand(root, command, settle);
+    if (!REQUIRE_COMMAND_APPROVAL) return runShellCommand(root, command, settle, conversationId);
 
     const pendingId = uuidv4();
     emit({ type: 'command_pending', pendingId, command });
@@ -595,7 +665,7 @@ function stageCommandExecution(root, command, emit, conversationId) {
       conversationId,
       onDecision: (approved) => {
         clearTimeout(timeout);
-        if (approved) runShellCommand(root, command, settle);
+        if (approved) runShellCommand(root, command, settle, conversationId);
         else settle('The user rejected running this command: "' + command + '". Do not retry it — ask what they want instead.');
       }
     });
@@ -613,6 +683,7 @@ function computeDiff(oldContent, newContent) {
 // via POST /api/chat/diff-approve.
 function stageFileChange(root, relPath, opts, emit, conversationId) {
   return new Promise((settle) => {
+    if (SENSITIVE_FILE_RX.test(relPath)) return settle('Error: writing to this file is blocked (matches a secrets/key pattern).');
     let p;
     try { p = safeResolve(root, relPath); } catch (e) { return settle('Error: ' + e.message); }
     const exists = fs.existsSync(p);
@@ -629,6 +700,10 @@ function stageFileChange(root, relPath, opts, emit, conversationId) {
     }
 
     const writeAndSettle = (note) => {
+      const latestOnDisk = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+      if (latestOnDisk !== currentContent) {
+        return settle('Error: ' + relPath + ' changed on disk while waiting for approval — change NOT applied to avoid overwriting the newer version. Re-read the file and retry.');
+      }
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, finalContent, 'utf8');
       settle((exists ? 'File edited: ' : 'File created: ') + relPath + note);
@@ -707,15 +782,14 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
       const startedAt = Date.now();
       try {
         if (call.function.name === 'read_file') {
-          const cacheKey = 'read:' + args.path;
-          result = readCache.has(cacheKey) ? '[Already shown earlier — reuse it]' : toolReadFile(projectRoot, args.path);
-          readCache.set(cacheKey, true);
+          if (readCache.has(args.path)) { result = readCache.get(args.path); }
+          else { result = toolReadFile(projectRoot, args.path); readCache.set(args.path, result); }
         } else if (call.function.name === 'write_file') {
           result = await stageFileChange(projectRoot, args.path, { isEdit: false, content: args.content }, emit, conversationId);
-          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; }
+          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; readCache.delete(args.path); }
         } else if (call.function.name === 'edit_file') {
           result = await stageFileChange(projectRoot, args.path, { isEdit: true, oldStr: args.old_str, newStr: args.new_str }, emit, conversationId);
-          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; }
+          if (!result.startsWith('Error') && !result.startsWith('Change to')) { editedFiles.add(args.path); touchedFiles = true; readCache.delete(args.path); }
         } else if (call.function.name === 'execute_command') {
           result = await stageCommandExecution(projectRoot, args.command, emit, conversationId);
         } else if (call.function.name === 'search_codebase') {
@@ -725,7 +799,7 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
         }
       } catch (e) { result = 'Error: ' + e.message; }
       emit({ type: 'tool_end', callId, tool: call.function.name, ms: Date.now() - startedAt, ok: !result.startsWith('Error'), preview: (result || '').slice(0, 300) });
-      messages.push({ role: 'tool', content: result });
+      messages.push({ role: 'tool', content: result, tool_call_id: call.id || callId });
     }
     if (touchedFiles) codeIndex.buildIndex(projectRoot).catch(() => {}); // fire-and-forget, now the edits are actually on disk
   }
@@ -853,17 +927,27 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
 }
 
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
+const WALK_NODE_CAP = parseInt(process.env.WALK_NODE_CAP || '20000', 10);
 
-function walk(dir, base = dir) {
-  return fs.readdirSync(dir, { withFileTypes: true })
-    .filter(e => !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'))
-    .map(e => {
-      const full = path.join(dir, e.name);
-      const rel = path.relative(base, full);
-      return e.isDirectory()
-        ? { name: e.name, path: rel, type: 'dir', children: walk(full, base) }
-        : { name: e.name, path: rel, type: 'file' };
-    });
+function walk(dir, base = dir, seen = new Set(), counter = { n: 0 }) {
+  if (counter.n > WALK_NODE_CAP) return [{ name: '[truncated — too many files, use search_codebase instead]', path: '', type: 'file' }];
+  let entries, real;
+  try { real = fs.realpathSync(dir); } catch { return []; }
+  if (seen.has(real)) return []; // symlink cycle — stop instead of recursing forever
+  seen.add(real);
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return []; } // unreadable/broken dir — skip instead of crashing the whole tree
+  const out = [];
+  for (const e of entries) {
+    if (IGNORE_DIRS.has(e.name) || e.name.startsWith('.')) continue;
+    if (++counter.n > WALK_NODE_CAP) { out.push({ name: '[truncated — too many files, use search_codebase instead]', path: '', type: 'file' }); break; }
+    const full = path.join(dir, e.name);
+    const rel = path.relative(base, full);
+    out.push(e.isDirectory()
+      ? { name: e.name, path: rel, type: 'dir', children: walk(full, base, seen, counter) }
+      : { name: e.name, path: rel, type: 'file' });
+  }
+  return out;
 }
 
 app.post('/api/project/open', (req, res) => {
@@ -903,7 +987,9 @@ app.get('/api/project/file', (req, res) => {
     }
 
     const root = path.resolve(req.query.root);
-    const p = path.resolve(req.query.path);
+    const relPath = path.isAbsolute(req.query.path) ? path.relative(root, req.query.path) : req.query.path;
+    let p;
+    try { p = safeResolve(root, relPath); } catch { return res.status(403).json({ error: 'Path outside opened project root' }); }
 
     if (!(p === root || p.startsWith(root + path.sep))) {
       return res.status(403).json({ error: 'Path outside opened project root' });
@@ -913,8 +999,16 @@ app.get('/api/project/file', (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
+    const realRoot = fs.realpathSync(root);
+    const realP = fs.realpathSync(p);
+    if (!(realP === realRoot || realP.startsWith(realRoot + path.sep))) {
+      return res.status(403).json({ error: 'Path outside opened project root (symlink)' });
+    }
+
     let content;
     try {
+      const stat = fs.statSync(p);
+      if (stat.size > 20 * 1024 * 1024) return res.status(413).json({ error: 'File too large to preview (' + Math.round(stat.size/1024/1024) + 'MB)' });
       content = fs.readFileSync(p, 'utf8');
     } catch {
       return res.status(400).json({ error: 'File not readable as text' });
@@ -929,8 +1023,19 @@ app.get('/api/project/file', (req, res) => {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
+app.get('/api/conversations/:id/events', (req, res) => {
+  try { res.json(db.getEvents(req.params.id)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST });
+});
+
+// Safety net: guarantees every route returns JSON, never a raw HTML 500 page.
+app.use((err, req, res, next) => {
+  log.error('[unhandled]', err.message);
+  if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 setInterval(() => {
@@ -944,7 +1049,7 @@ setInterval(() => {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function generateTitle(message) {
-  return message.replace(/[^\w\s,.?!-]/g, '').trim().slice(0, 60).replace(/\s+/g, ' ') || 'New Chat';
+  return message.replace(/[^\p{L}\p{N}\s,.?!-]/gu, '').trim().slice(0, 60).replace(/\s+/g, ' ') || 'New Chat';
 }
 
 function trimHistoryToBudget(history, maxChars) {
