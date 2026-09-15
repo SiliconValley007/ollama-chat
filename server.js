@@ -44,8 +44,8 @@ const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '30m';
 // budget between them instead of letting each claim its own full share, which could
 // sum to more than OLLAMA_NUM_CTX. ~3.5 chars/token conservative estimate for code.
 const CTX_CHAR_BUDGET = Math.floor((OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT) * 3.5);
-const TOOL_LOOP_CHAR_BUDGET = parseInt(process.env.TOOL_LOOP_CHAR_BUDGET || String(Math.floor(CTX_CHAR_BUDGET * 0.55)), 10);
-const MAX_HISTORY_CHARS = parseInt(process.env.MAX_HISTORY_CHARS || String(Math.floor(CTX_CHAR_BUDGET * 0.35)), 10);
+const TOOL_LOOP_CHAR_BUDGET = intEnv('TOOL_LOOP_CHAR_BUDGET', Math.floor(CTX_CHAR_BUDGET * 0.55));
+const MAX_HISTORY_CHARS = intEnv('MAX_HISTORY_CHARS', Math.floor(CTX_CHAR_BUDGET * 0.35));
 const REQUIRE_DIFF_APPROVAL = process.env.REQUIRE_DIFF_APPROVAL !== 'false'; // default ON
 const ENABLE_SHELL_TOOL = process.env.ENABLE_SHELL_TOOL !== 'false'; // default ON — gated by per-call approval
 const REQUIRE_COMMAND_APPROVAL = process.env.REQUIRE_COMMAND_APPROVAL !== 'false'; // default ON
@@ -59,7 +59,12 @@ const PUBLIC_ASSETS = new Set(['/', '/index.html', '/sw.js', '/manifest.json', '
 app.use((req, res, next) => {
   if (req.path.startsWith('/vendor')) return next(); // ✅ allow static
   if (PUBLIC_ASSETS.has(req.path)) return next();
+  // Query-param fallback kept only for the one-time first-visit bootstrap link in
+  // the README; the client immediately caches to localStorage/header after that.
   const supplied = String(req.headers['x-app-token'] || req.query.token || '');
+  if (!req.headers['x-app-token'] && req.query.token) {
+    log.warn('[auth] token supplied via query string — avoid this outside first-time setup');
+  }
   const expected = Buffer.from(SHARED_TOKEN);
   const given = Buffer.from(supplied);
   const ok = given.length === expected.length && require('crypto').timingSafeEqual(given, expected);
@@ -106,7 +111,8 @@ app.get('/api/conversations/:id', (req, res) => {
 
 app.patch('/api/conversations/:id', (req, res) => {
   try {
-    db.updateConversationTitle(req.params.id, req.body.title || 'Untitled');
+    const clean = String(req.body.title || 'Untitled').replace(/[^\p{L}\p{N}\s,.?!-]/gu, '').trim().slice(0, 100) || 'Untitled';
+    db.updateConversationTitle(req.params.id, clean);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -332,7 +338,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     userAborted = true;
     if (!finished) ollamaReq?.destroy();
     const turn = activeTurns.get(conversationId);
-    if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); turn.activeChild?.kill('SIGTERM'); }
+    if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
     for (const [id, p] of pendingDiffs) if (p.conversationId === conversationId) { pendingDiffs.delete(id); p.onDecision(false); }
     for (const [id, p] of pendingCommands) if (p.conversationId === conversationId) { pendingCommands.delete(id); p.onDecision(false); }
     // Save whatever partial reply had streamed in so far, and still set the
@@ -350,6 +356,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       if (conversation.title === 'New Chat') {
         db.updateConversationTitle(conversationId, generateTitle(message || storage_lines[0] || 'File upload'));
       }
+      db.flushSync(); // durability point — a completed reply must survive a crash, not wait on the debounce
     }
     if (!res.writableEnded) {
       res.write('data: ' + JSON.stringify({ done: true, messageId: assistantMsgId, conversationId }) + '\n\n');
@@ -357,10 +364,17 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     }
   }
 
-  function sendError(msg) {
-    activeTurns.delete(conversationId);
-    if (!res.writableEnded) { res.write('data: ' + JSON.stringify({ error: msg }) + '\n\n'); res.end(); }
+function sendError(msg) {
+  activeTurns.delete(conversationId);
+  if (assistantContent && !finished) {
+    finished = true;
+    db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent, lastEditedFiles);
+    if (conversation.title === 'New Chat') {
+      db.updateConversationTitle(conversationId, generateTitle(message || storage_lines[0] || 'File upload'));
+    }
   }
+  if (!res.writableEnded) { res.write('data: ' + JSON.stringify({ error: msg }) + '\n\n'); res.end(); }
+}
 
     if (projectRoot) {
     try {
@@ -377,8 +391,10 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       let result, usedModel = conversation.model || DEFAULT_MODEL;
       const chain = [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)];
       let lastErr;
+      const sharedMessages = historyForOllama.slice();
+      const sharedEditedFiles = new Set();
       for (const m of chain) {
-        try { result = await resolveToolCalls(historyForOllama.slice(), projectRoot, m, conversationId, emit); usedModel = m; break; }
+        try { result = await resolveToolCalls(sharedMessages, projectRoot, m, conversationId, emit, sharedEditedFiles); usedModel = m; break; }
         catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
       }
       if (!result) throw lastErr || new Error('All models exhausted');
@@ -539,7 +555,7 @@ app.get('/api/models', (req, res) => {
   const urlObj = new URL(OLLAMA_HOST + '/api/tags');
   const httpMod = urlObj.protocol === 'https:' ? require('https') : require('http');
   let data = '';
-  const r = httpMod.get(OLLAMA_HOST + '/api/tags', ollamaRes => {
+  const r = httpMod.get(OLLAMA_HOST + '/api/tags', { timeout: 5000 }, ollamaRes => {
     ollamaRes.on('data', c => data += c);
     ollamaRes.on('end', () => {
       try {
@@ -550,7 +566,8 @@ app.get('/api/models', (req, res) => {
       catch { res.json([]); }
     });
   });
-  r.on('error', () => res.json([]));
+  r.on('timeout', () => { r.destroy(); if (!res.headersSent) res.json([]); });
+  r.on('error', () => { if (!res.headersSent) res.json([]); });
 });
 
 function loadProjectRules(root) {
@@ -610,7 +627,7 @@ function enforceToolBudget(messages, budgetChars) {
   }
 }
 
-const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_[re]?[cd]sa.*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
+const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
 function toolReadFile(root, relPath) {
   if (SENSITIVE_FILE_RX.test(relPath)) return 'Error: reading this file is blocked (matches a secrets/key pattern) — this project sends file contents to a cloud-hosted model.';
   const resolved = safeResolve(root, relPath);
@@ -631,10 +648,16 @@ const SHELL_BLOCKLIST = [
   /\b(rm|del|rmdir|remove-item|rd)\b[^\n]*\.\.(?:[\\/]|\s|$)/i
 ];
 
+function killProcessTree(child) {
+  if (!child || !child.pid || child.killed) return;
+  if (process.platform === 'win32') { try { execFile('taskkill', ['/pid', String(child.pid), '/T', '/F']); } catch {} }
+  else { try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} } }
+}
+
 function runShellCommand(root, command, settle, conversationId) {
   const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
   const shellFlag = process.platform === 'win32' ? '/c' : '-c';
-  const child = execFile(shell, [shellFlag, command], { cwd: root, timeout: 60000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+  const child = execFile(shell, [shellFlag, command], { cwd: root, timeout: 60000, maxBuffer: 2 * 1024 * 1024, detached: process.platform !== 'win32' }, (err, stdout, stderr) => {
     const t = activeTurns.get(conversationId);
     if (t) t.activeChild = null;
     const out = (stdout || '').slice(0, 8000);
@@ -741,9 +764,8 @@ function summarizeArgs(toolName, args) {
   return {};
 }
 
-async function resolveToolCalls(messages, projectRoot, model, conversationId, emit) {
+async function resolveToolCalls(messages, projectRoot, model, conversationId, emit, editedFiles = new Set()) {
   const readCache = new Map();
-  const editedFiles = new Set();
   let totalPromptTokens = 0, totalEvalTokens = 0;
   for (let i = 0; i < MAX_TOOL_CALLS; i++) {
     const turn = activeTurns.get(conversationId);
@@ -850,7 +872,7 @@ const PROJECT_TOOLS = [
     type: 'function',
     function: {
       name: 'execute_command',
-      description: 'Run a shell command inside the opened project root — tests, linters, builds, `npm install`, etc. Use this to self-verify changes before telling the user they are done. Output is truncated to 8000 chars. Destructive or system-level commands are blocked server-side.',
+      description: 'Run a shell command inside the opened project root — tests, linters, builds, `npm install`, etc. Use this to self-verify changes before telling the user they are done. Output is truncated to 8000 chars. A best-effort denylist blocks common destructive patterns, but it is not exhaustive — every command still requires explicit user approval before running, which is the actual safety boundary.',
       parameters: {
         type: 'object',
         properties: { command: { type: 'string', description: 'e.g. "npm test", "npm run lint", "python -m pytest"' } },
@@ -927,12 +949,13 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
 }
 
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
-const WALK_NODE_CAP = parseInt(process.env.WALK_NODE_CAP || '20000', 10);
+const WALK_NODE_CAP = intEnv('WALK_NODE_CAP', 20000);
 
 function walk(dir, base = dir, seen = new Set(), counter = { n: 0 }) {
   if (counter.n > WALK_NODE_CAP) return [{ name: '[truncated — too many files, use search_codebase instead]', path: '', type: 'file' }];
-  let entries, real;
-  try { real = fs.realpathSync(dir); } catch { return []; }
+  let entries, real, realBase;
+  try { real = fs.realpathSync(dir); realBase = fs.realpathSync(base); } catch { return []; }
+  if (real !== realBase && !real.startsWith(realBase + path.sep)) return []; // symlink escapes project root — skip
   if (seen.has(real)) return []; // symlink cycle — stop instead of recursing forever
   seen.add(real);
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
@@ -1029,7 +1052,14 @@ app.get('/api/conversations/:id/events', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST });
+  const u = new URL(OLLAMA_HOST + '/api/tags');
+  const mod = u.protocol === 'https:' ? require('https') : require('http');
+  const r = mod.get({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname, timeout: 3000 }, ollamaRes => {
+    ollamaRes.resume();
+    res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST, ollamaReachable: ollamaRes.statusCode === 200 });
+  });
+  r.on('timeout', () => { r.destroy(); res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST, ollamaReachable: false, warning: 'Ollama did not respond within 3s' }); });
+  r.on('error', () => res.json({ status: 'ok', model: DEFAULT_MODEL, ollama: OLLAMA_HOST, ollamaReachable: false, warning: 'Ollama unreachable — is it running?' }));
 });
 
 // Safety net: guarantees every route returns JSON, never a raw HTML 500 page.
@@ -1086,7 +1116,7 @@ db.init().then(() => {
       if (shuttingDown) return;
       shuttingDown = true;
       log.info('Shutting down: closing active streams and flushing database...');
-      for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); }
+      for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
       try { db.flushSync(); } catch (e) { log.error('DB flush failed:', e.message); }
       server.close(() => { log.info('Shutdown complete.'); process.exit(0); });
       setTimeout(() => process.exit(0), 2000); // force-exit if something hangs

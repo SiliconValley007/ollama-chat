@@ -20,9 +20,11 @@ set OLLAMA_HOST=http://localhost:11434
 
 :: Auth token shared between server and browser UI (required — server refuses to start without it)
 if not exist "%~dp0.app_token" (
-    for /f %%g in ('powershell -NoProfile -Command "[guid]::NewGuid().ToString('N')"') do >"%~dp0.app_token" echo|set /p="%%g"
+    powershell -NoProfile -Command "[IO.File]::WriteAllText('%~dp0.app_token', [guid]::NewGuid().ToString('N'))"
 )
 set /p APP_TOKEN=<"%~dp0.app_token"
+echo App token: %APP_TOKEN%
+echo.
 
 :: Check Node.js
 where node >nul 2>&1
@@ -48,9 +50,10 @@ if not exist "%~dp0node_modules\" (
 :: Show access URLs
 echo Access URLs:
 for /f "tokens=*" %%a in ('powershell -Command "(Get-NetIPAddress -InterfaceAlias '*Tailscale*' -AddressFamily IPv4 2>$null).IPAddress"') do (
-    echo   Phone  ^(Tailscale^): http://%%a:%PORT%
+    echo   Phone  ^(Tailscale^): http://%%a:%PORT%/?token=%APP_TOKEN%
 )
-echo   Browser ^(this PC^):  http://localhost:%PORT%
+echo   Browser ^(this PC^):  http://localhost:%PORT%/?token=%APP_TOKEN%
+echo.
 echo.
 echo Model: %OLLAMA_MODEL%
 echo Starting server... Press Ctrl+C to stop.

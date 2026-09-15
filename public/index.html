@@ -1731,6 +1731,15 @@
         </div>
       </div>
     </div>
+    <div id="pdfPreviewModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:var(--bg2,#1e1e22);border-radius:10px;max-width:80vw;max-height:85vh;overflow:auto;padding:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div id="pdfPreviewTitle" style="font-weight:600;"></div>
+          <button onclick="document.getElementById('pdfPreviewModal').style.display='none'" style="background:none;border:none;color:inherit;font-size:18px;cursor:pointer;">✕</button>
+        </div>
+        <div id="pdfPreviewBody"></div>
+      </div>
+    </div>
     <div id="toast"></div>
 
     <script>
@@ -1755,7 +1764,9 @@
           applyTheme();
         }
         await checkHealth();
-        document.getElementById("model-badge").textContent = currentModel;
+        if (document.getElementById("status-dot").dataset.state !== "offline") {
+          document.getElementById("model-badge").textContent = currentModel;
+        }
         await loadConversations();
         setInterval(checkHealth, 15000);
         // Retry loading conversations if first attempt returned nothing (SW race on cold start)
@@ -1815,9 +1826,24 @@
           }
           window.__APP_TOKEN = APP_TOKEN;
           const r = await fetch("/api/health");
-          if (!r.ok) { throw new Error("Token not found"); }
-          await r.json();
-          setStatus("online");
+          if (r.status === 401) {
+            localStorage.removeItem("app_token");
+            setStatus("offline");
+            document.getElementById("model-badge").textContent = "invalid token";
+            throw new Error("Unauthorized");
+          }
+          if (!r.ok) { throw new Error("Health check failed (" + r.status + ")"); }
+          const health = await r.json();
+          if (health.ollamaReachable === false) {
+            setStatus("offline");
+            document.getElementById("model-badge").textContent = "Ollama not running";
+          } else {
+            setStatus("online");
+            const badge = document.getElementById("model-badge");
+            if (["offline", "Ollama not running", "invalid token"].includes(badge.textContent)) {
+              badge.textContent = currentModel;
+            }
+          }
           loadModels();
         } catch {
           setStatus("offline");
@@ -1841,18 +1867,13 @@
             '<div class="model-option" style="color:var(--text3)">No models found</div>';
           return;
         }
-        dd.innerHTML = availableModels
-          .map(
-            (m) =>
-              '<div class="model-option' +
-              (m.name === currentModel ? " active" : "") +
-              '" onclick="selectModel(\'' +
-              escHtml(m.name) +
-              "')\">" +
-              escHtml(m.name) +
-              "</div>",
-          )
-          .join("");
+        dd.innerHTML = availableModels.map((m) =>
+          '<div class="model-option' + (m.name === currentModel ? " active" : "") +
+          '" data-model="' + escHtml(m.name) + '">' + escHtml(m.name) + "</div>"
+        ).join("");
+        dd.querySelectorAll('.model-option[data-model]').forEach(el =>
+          el.addEventListener('click', () => selectModel(el.dataset.model))
+        );
       }
 
       function toggleModelDropdown() {
@@ -1872,6 +1893,7 @@
 
       function setStatus(state) {
         const dot = document.getElementById("status-dot");
+        dot.dataset.state = state;
         dot.className =
           state === "offline"
             ? "offline"
@@ -2269,11 +2291,7 @@
           "</div>" +
           "</div>" +
           '<div class="conv-actions">' +
-          '<button class="conv-action-btn" onclick="startRenameById(event,\'' +
-          c.id +
-          "','" +
-          escHtml(c.title) +
-          '\')" title="Rename">' +
+          '<button class="conv-action-btn" data-act="rename" title="Rename">' +
           '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
           "</button>" +
           '<button class="conv-action-btn" onclick="exportConvById(event,\'' +
@@ -2287,6 +2305,9 @@
           '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>' +
           "</button>" +
           "</div>";
+        div.querySelector('[data-act="rename"]')?.addEventListener('click', e => { e.stopPropagation(); startRename(div, c.id, c.title); });
+        div.querySelector('[data-act="export"]')?.addEventListener('click', e => { e.stopPropagation(); exportConvById(e, c.id); });
+        div.querySelector('[data-act="delete"]')?.addEventListener('click', e => { e.stopPropagation(); deleteConv(e, c.id); });
         div.addEventListener("click", (e) => {
           if (!e.target.closest(".conv-actions")) loadConversation(c.id);
         });
@@ -3131,7 +3152,6 @@
         const stallTimer = setInterval(() => {
           if (Date.now() - lastEventAt > 15000) {
             statusWrap.querySelector(".status-text").textContent = "⚠ No update for 15s — may be stuck";
-            clearInterval(stallTimer);
           }
         }, 5000);
 
@@ -3147,6 +3167,9 @@
             if (typingEl.parentNode) typingEl.remove();
             appendErrorMessage(msg, () => sendMessage(overrideText));
             clearInterval(stallTimer);
+            clearInterval(statusTimerInt);
+            if (statusWrap.parentNode) statusWrap.remove();
+            if (statusDetail.parentNode) statusDetail.remove();
             setStreaming(false);
             return;
           }
@@ -3154,6 +3177,7 @@
           const decoder = new TextDecoder();
           let partial = "";
 
+          let receivedDone = false;
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -3167,6 +3191,10 @@
                 if (data.error) {
                   if (typingEl.parentNode) typingEl.remove();
                   appendErrorMessage(data.error, () => sendMessage(overrideText));
+                  clearInterval(stallTimer);
+                  clearInterval(statusTimerInt);
+                  if (statusWrap.parentNode) statusWrap.remove();
+                  if (statusDetail.parentNode) statusDetail.remove();
                   setStreaming(false);
                   return;
                 }
@@ -3235,6 +3263,7 @@
                   scrollToBottomIfNearBottom();
                 }
                 if (data.done) {
+                  receivedDone = true;
                   newMsgId = data.messageId;
                   if (streamBubble) {
                     streamBubble.classList.remove("streaming-cursor");
@@ -3268,6 +3297,16 @@
               } catch (_) {}
             }
           }
+          if (!receivedDone) {
+            clearInterval(stallTimer);
+            clearInterval(statusTimerInt);
+            if (statusWrap.parentNode) statusWrap.remove();
+            if (statusDetail.parentNode) statusDetail.remove();
+            if (typingEl.parentNode) typingEl.remove();
+            if (streamBubble) streamBubble.classList.remove("streaming-cursor");
+            appendErrorMessage("Connection closed before the response finished.", () => sendMessage(overrideText));
+            setStreaming(false);
+          }
         } catch (err) {
           clearInterval(stallTimer);
           clearInterval(statusTimerInt);
@@ -3281,6 +3320,7 @@
             appendErrorMessage("Connection error: " + err.message);
           }
           setStreaming(false);
+          checkHealth();
         }
       }
 

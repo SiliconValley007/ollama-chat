@@ -27,9 +27,16 @@ function indexPathFor(root) {
   return path.join(dir, hash + '.json');
 }
 
+function atomicWriteJSON(filePath, obj) {
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj));
+  fs.renameSync(tmp, filePath); // rename is atomic — filePath is never left half-written
+}
+
 function listFiles(dir, base = dir, out = [], seen = new Set()) {
-  let entries, real;
-  try { real = fs.realpathSync(dir); } catch { return out; }
+  let entries, real, realBase;
+  try { real = fs.realpathSync(dir); realBase = fs.realpathSync(base); } catch { return out; }
+  if (real !== realBase && !real.startsWith(realBase + path.sep)) return out; // symlink escapes project root — never index/embed it
   if (seen.has(real)) return out; // symlink cycle — stop instead of recursing forever
   seen.add(real);
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
@@ -87,33 +94,57 @@ async function buildIndex(root) {
   if (buildStatus.get(key)?.status === 'running') return; // prevent overlapping builds racing on the same index file
   buildStatus.set(key, { status: 'running', total: 0, done: 0 });
   try {
+    // Reuse vectors for files whose content hash hasn't changed since the last
+    // build — avoids re-burning embed quota/time on every edit for a single-file change.
+    let prevByPath = new Map();
+    try {
+      const prev = JSON.parse(fs.readFileSync(indexPathFor(root), 'utf8'));
+      for (const e of (prev.entries || [])) {
+        if (!prevByPath.has(e.path)) prevByPath.set(e.path, []);
+        prevByPath.get(e.path).push(e);
+      }
+    } catch {}
+
     const files = listFiles(root);
     const entries = [];
     let totalChunks = 0;
     const perFileChunks = files.map(f => {
       try {
         const full = path.join(root, f);
-        if (fs.statSync(full).size > 500 * 1024) return { f, chunks: [] };
+        if (fs.statSync(full).size > 500 * 1024) return { f, chunks: [], hash: null };
         const content = fs.readFileSync(full, 'utf8');
+        const hash = crypto.createHash('sha1').update(content).digest('hex');
         const chunks = chunkFile(content);
         totalChunks += chunks.length;
-        return { f, chunks };
-      } catch { return { f, chunks: [] }; }
+        return { f, chunks, hash };
+      } catch { return { f, chunks: [], hash: null }; }
     });
     buildStatus.set(key, { status: 'running', total: totalChunks, done: 0 });
 
     let done = 0;
-    for (const { f, chunks } of perFileChunks) {
+    for (const { f, chunks, hash } of perFileChunks) {
+      const cached = hash && prevByPath.get(f);
+      if (cached && cached.length && cached[0].fileHash === hash) {
+        entries.push(...cached);
+        done += chunks.length;
+        buildStatus.set(key, { status: 'running', total: totalChunks, done });
+        continue;
+      }
       for (const c of chunks) {
         try {
           const vector = await embed(c.text);
-          entries.push({ path: f, startLine: c.startLine, endLine: c.endLine, text: c.text, vector });
+          entries.push({ path: f, startLine: c.startLine, endLine: c.endLine, text: c.text, vector, fileHash: hash });
         } catch (e) { console.warn('[codeIndex] embed failed for', f, e.message); }
         done++;
         buildStatus.set(key, { status: 'running', total: totalChunks, done });
+        // Checkpoint every 200 chunks — bounds data loss on crash/restart to one
+        // checkpoint interval instead of the entire (potentially hours-long) build.
+        if (done % 200 === 0) {
+          try { atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries, partial: true }); } catch {}
+        }
       }
     }
-    fs.writeFileSync(indexPathFor(root), JSON.stringify({ builtAt: Date.now(), fileCount: files.length, entries }));
+    atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries });
     buildStatus.set(key, { status: 'done', total: totalChunks, done: totalChunks });
   } catch (e) {
     buildStatus.set(key, { status: 'error', error: e.message, total: 0, done: 0 });

@@ -95,16 +95,31 @@ couple minutes).
 ## 6. Start the app
 
 The server requires an `APP_TOKEN` to be set — it will refuse to start
-without it. **Windows:** `start.bat` generates one for you automatically.
-**Mac/Linux:** set it yourself before starting:
-```
+without it. **Windows:** `start.bat` generates one for you automatically —
+skip this box.
+**Mac/Linux, using `start.sh`:** nothing to do — `start.sh` generates `.app_token`
+automatically (like `start.bat`) and prints the full URL with the token included.
+**Mac/Linux, only if running `node server.js` directly (not `start.sh`):** set it yourself:
+````bash
 export APP_TOKEN=$(openssl rand -hex 16)
 echo "Your token: $APP_TOKEN"   # copy this for step 7
+````
+**Windows PowerShell (only if running `node server.js` directly instead of
+`start.bat`):**
+````powershell
+$env:APP_TOKEN = -join ((48..57)+(97..102)|Get-Random -Count 32|%{[char]$_})
+echo "Your token: $env:APP_TOKEN"
 ````
 
 **Windows:** double-click `start.bat`.
 
 **Mac/Linux, or if `start.bat` doesn't work:** in the terminal, run:
+```
+chmod +x start.sh
+./start.sh
+```
+
+**If you want to directly run using node
 ```
 node server.js
 ```
