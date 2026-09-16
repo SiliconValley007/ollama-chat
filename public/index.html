@@ -1754,6 +1754,7 @@
       let lastAssistantMsgId = null;
       let lastUserMsgId = null;
       let isDarkTheme = true;
+      let tokenPromptShown = false;
 
       // ── Init ──────────────────────────────────────────────────────────────────────
       async function init() {
@@ -1814,7 +1815,7 @@
       async function checkHealth() {
         try {
           let APP_TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("app_token") || "";
-          if (!APP_TOKEN) { APP_TOKEN = prompt("Enter your APP_TOKEN (see .app_token file):") || ""; }
+          if (!APP_TOKEN && !tokenPromptShown) { tokenPromptShown = true; APP_TOKEN = prompt("Enter your APP_TOKEN (see .app_token file):") || ""; }
           if (APP_TOKEN) localStorage.setItem("app_token", APP_TOKEN);
           if (!window.__fetchPatched) {
             window.__fetchPatched = true;
@@ -1830,7 +1831,7 @@
             localStorage.removeItem("app_token");
             setStatus("offline");
             document.getElementById("model-badge").textContent = "invalid token";
-            throw new Error("Unauthorized");
+            return;
           }
           if (!r.ok) { throw new Error("Health check failed (" + r.status + ")"); }
           const health = await r.json();
@@ -2191,9 +2192,11 @@
       }
 
       // ── Search ────────────────────────────────────────────────────────────────────
+      let searchSeq = 0;
       function onSearch(val) {
         clearTimeout(searchDebounce);
         searchDebounce = setTimeout(async () => {
+          const mySeq = ++searchSeq;
           if (!val.trim()) {
             loadConversations();
             return;
@@ -2203,6 +2206,7 @@
               "/api/conversations/search?q=" + encodeURIComponent(val.trim()),
             );
             const results = await r.json();
+            if (mySeq !== searchSeq) return; // a newer search superseded this one
             renderConversationList(results, true);
           } catch {}
         }, 300);
@@ -2407,20 +2411,29 @@
         // Merge stored tool_start/tool_end events back into the timeline so a
         // reopened chat shows the same read/edit/search trace the live stream did.
         const toolEvents = (rawEvents || [])
-          .filter((e) => e.type === "tool_start" || e.type === "tool_end")
+          .filter((e) => ["tool_start","tool_end","diff_pending","command_pending","diff_decided","command_decided"].includes(e.type))
           .map((e) => {
             try { return { at: e.created_at, payload: JSON.parse(e.payload) }; }
             catch { return null; }
           })
           .filter(Boolean);
+        const decidedMap = new Map(toolEvents
+          .filter(e => e.payload.type === "diff_decided" || e.payload.type === "command_decided")
+          .map(e => [e.payload.pendingId, e.payload.approved]));
         const timeline = [
           ...messages.map((m) => ({ at: m.created_at, kind: "message", m })),
-          ...toolEvents.map((e) => ({ at: e.at, kind: "event", payload: e.payload })),
+          ...toolEvents
+            .filter(e => e.payload.type !== "diff_decided" && e.payload.type !== "command_decided")
+            .map((e) => ({ at: e.at, kind: "event", payload: e.payload })),
         ].sort((a, b) => a.at - b.at);
         timeline.forEach((item) => {
           if (item.kind === "message") {
             if (item.m.role === "steer") { renderSteerNote(inner, item.m.content); return; }
             appendMessage(item.m.role, item.m.content, false, item.m.id, item.m.created_at);
+          } else if (item.payload.type === "diff_pending") {
+            renderDiffCard(inner, item.payload, decidedMap.get(item.payload.pendingId));
+          } else if (item.payload.type === "command_pending") {
+            renderCommandCard(inner, item.payload, decidedMap.get(item.payload.pendingId));
           } else {
             renderToolActivity(inner, item.payload);
           }
@@ -2660,7 +2673,7 @@
         const label = {
           read_file: "📖 Reading", write_file: "📝 Writing", edit_file: "✏️ Editing",
           execute_command: "⚙️ Running", search_codebase: "🔎 Searching"
-        }[data.tool] || ("🔧 " + data.tool);
+        }[data.tool] || ("🔧 " + escHtml(String(data.tool)));
         if (data.type === "tool_start") {
           const detail = data.args && (data.args.path || data.args.command || data.args.query) || "";
           const el = document.createElement("div");
@@ -2677,7 +2690,7 @@
         }
       }
 
-      function renderDiffCard(container, data) {
+      function renderDiffCard(container, data, decided) {
         const card = document.createElement("div");
         card.className = "diff-card";
         const header = document.createElement("div");
@@ -2695,6 +2708,16 @@
         });
         card.appendChild(body);
 
+        if (decided !== undefined) {
+          const doneActions = document.createElement("div");
+          doneActions.className = "diff-card-actions";
+          card.classList.add(decided ? "diff-decided-approve" : "diff-decided-reject");
+          doneActions.innerHTML = decided ? "Approved" : "Rejected";
+          card.appendChild(doneActions);
+          container.appendChild(card);
+          return;
+        }
+
         const actions = document.createElement("div");
         actions.className = "diff-card-actions";
         const approveBtn = document.createElement("button");
@@ -2705,10 +2728,19 @@
         rejectBtn.textContent = "❌ Reject";
         const decide = async (approve) => {
           approveBtn.disabled = true; rejectBtn.disabled = true;
-          await fetch("/api/chat/diff-approve", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ pendingId: data.pendingId, approve })
-          });
+          let ok = false;
+          try {
+            const r = await fetch("/api/chat/diff-approve", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ pendingId: data.pendingId, approve })
+            });
+            ok = r.ok;
+          } catch {}
+          if (!ok) {
+            card.classList.add("diff-decided-reject");
+            actions.innerHTML = "⚠ Expired — no longer pending, nothing was applied";
+            return;
+          }
           card.classList.add(approve ? "diff-decided-approve" : "diff-decided-reject");
           actions.innerHTML = approve ? "Approved" : "Rejected";
         };
@@ -2721,7 +2753,7 @@
         container.appendChild(card);
       }
 
-      function renderCommandCard(container, data) {
+      function renderCommandCard(container, data, decided) {
         const card = document.createElement("div");
         card.className = "diff-card";
         const header = document.createElement("div");
@@ -2733,6 +2765,15 @@
         body.style.padding = "10px 12px";
         body.textContent = data.command;
         card.appendChild(body);
+        if (decided !== undefined) {
+          const doneActions = document.createElement("div");
+          doneActions.className = "diff-card-actions";
+          card.classList.add(decided ? "diff-decided-approve" : "diff-decided-reject");
+          doneActions.innerHTML = decided ? "Running…" : "Skipped";
+          card.appendChild(doneActions);
+          container.appendChild(card);
+          return;
+        }
         const actions = document.createElement("div");
         actions.className = "diff-card-actions";
         const approveBtn = document.createElement("button");
@@ -2743,10 +2784,19 @@
         rejectBtn.textContent = "❌ Don't run";
         const decide = async (approve) => {
           approveBtn.disabled = true; rejectBtn.disabled = true;
-          await fetch("/api/chat/command-approve", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ pendingId: data.pendingId, approve })
-          });
+          let ok = false;
+          try {
+            const r = await fetch("/api/chat/command-approve", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ pendingId: data.pendingId, approve })
+            });
+            ok = r.ok;
+          } catch {}
+          if (!ok) {
+            card.classList.add("diff-decided-reject");
+            actions.innerHTML = "⚠ Expired — no longer pending, command did not run";
+            return;
+          }
           card.classList.add(approve ? "diff-decided-approve" : "diff-decided-reject");
           actions.innerHTML = approve ? "Running…" : "Skipped";
         };
@@ -2777,7 +2827,9 @@
       function editMessage(btn, msgId) {
         const wrapper = btn.closest(".message-wrapper");
         const bubble = wrapper.querySelector(".msg-bubble");
-        const currentText = bubble.innerText.trim();
+        const clone = bubble.cloneNode(true);
+        clone.querySelectorAll(".msg-attachments").forEach((el) => el.remove());
+        const currentText = clone.innerText.trim();
         const actions = wrapper.querySelector(".msg-actions");
 
         const ta = document.createElement("textarea");
@@ -2858,35 +2910,28 @@
       // ── Regenerate ────────────────────────────────────────────────────────────────
       async function regenerateFrom(msgId) {
         if (isStreaming) return;
-        // Delete this assistant message and everything after from DB
-        await fetch(
-          "/api/conversations/" + currentConvId + "/messages-from/" + msgId,
-          { method: "DELETE" },
-        );
-
-        // Remove from DOM
         const inner = document.getElementById("messages-inner");
         const allWrappers = Array.from(
           inner.querySelectorAll(".message-wrapper"),
         );
-        let found = false;
-        allWrappers.forEach((w) => {
-          if (w.dataset.msgId === msgId || found) {
-            found = true;
-            w.remove();
-          }
-        });
-
-        // Get the last user message content to resend
-        const remaining = Array.from(
-          inner.querySelectorAll(".message-wrapper.user"),
-        );
-        if (!remaining.length) return;
-        const lastUser = remaining[remaining.length - 1];
+        const asstIdx = allWrappers.findIndex((w) => w.dataset.msgId === msgId);
+        if (asstIdx === -1) return;
+        let userIdx = asstIdx - 1;
+        while (userIdx >= 0 && !allWrappers[userIdx].classList.contains("user")) userIdx--;
+        if (userIdx < 0) return;
+        const lastUser = allWrappers[userIdx];
+        const lastMsgId = lastUser.dataset.msgId;
         const lastContent = lastUser
           .querySelector(".msg-bubble")
           .innerText.trim();
-                const lastMsgId = lastUser.dataset.msgId;
+
+        // Delete the user turn being resent AND everything after it (including
+        // the assistant reply) so we don't leave a duplicate user message behind.
+        await fetch(
+          "/api/conversations/" + currentConvId + "/messages-from/" + lastMsgId,
+          { method: "DELETE" },
+        );
+        allWrappers.slice(userIdx).forEach((w) => w.remove());
 
         document.getElementById("message-input").value = lastContent;
         sendMessage(lastContent);
@@ -3171,6 +3216,7 @@
             if (statusWrap.parentNode) statusWrap.remove();
             if (statusDetail.parentNode) statusDetail.remove();
             setStreaming(false);
+            checkHealth();
             return;
           }
           const reader = response.body.getReader();
@@ -3190,12 +3236,14 @@
                 const data = JSON.parse(line.slice(6));
                 if (data.error) {
                   if (typingEl.parentNode) typingEl.remove();
+                  if (streamBubble) streamBubble.classList.remove("streaming-cursor");
                   appendErrorMessage(data.error, () => sendMessage(overrideText));
                   clearInterval(stallTimer);
                   clearInterval(statusTimerInt);
                   if (statusWrap.parentNode) statusWrap.remove();
                   if (statusDetail.parentNode) statusDetail.remove();
                   setStreaming(false);
+                  checkHealth();
                   return;
                 }
                 if (data.type === "tool_start" || data.type === "tool_end") {
@@ -3206,6 +3254,8 @@
                       execute_command: "Running", search_codebase: "Searching" }[data.tool] || data.tool;
                     const detail = (data.args && (data.args.path || data.args.command || data.args.query)) || "";
                     statusWrap.querySelector(".status-text").textContent = label + (detail ? " " + detail : "") + "…";
+                  } else if (statusWrap.querySelector(".status-text").textContent.startsWith("⚠")) {
+                    statusWrap.querySelector(".status-text").textContent = "Working…";
                   }
                   renderToolActivity(statusDetail, data);
                   scrollToBottomIfNearBottom();
@@ -3221,6 +3271,12 @@
                   if (typingEl.parentNode) typingEl.remove();
                   renderCommandCard(inner, data);
                   scrollToBottomIfNearBottom();
+                  continue;
+                }
+                if (data.type === "diff_decided" || data.type === "command_decided") {
+                  lastEventAt = Date.now();
+                  const t = statusWrap.querySelector(".status-text");
+                  if (t.textContent.startsWith("⚠")) t.textContent = "Working…";
                   continue;
                 }
                 if (data.type === "model_used" || data.modelUsed || data.model_used) {
@@ -3306,6 +3362,7 @@
             if (streamBubble) streamBubble.classList.remove("streaming-cursor");
             appendErrorMessage("Connection closed before the response finished.", () => sendMessage(overrideText));
             setStreaming(false);
+            checkHealth();
           }
         } catch (err) {
           clearInterval(stallTimer);

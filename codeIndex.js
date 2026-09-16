@@ -12,7 +12,7 @@ const ALLOWED_EXT = new Set([
   '.md', '.txt', '.sh', '.bat', '.sql', '.gradle', '.properties', '.env'
 ]);
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db', 'music', 'output', 'gradle', '.gradle']);
-const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_[re]?[cd]sa.*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
+const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json|\.app_token|.*\.db)$/i;
 
 function normRoot(root) {
   let r = path.resolve(root);
@@ -153,7 +153,13 @@ async function buildIndex(root) {
 
 function getStatus(root) {
   const key = normRoot(root);
-  return buildStatus.get(key) || { status: fs.existsSync(indexPathFor(root)) ? 'done' : 'none', total: 0, done: 0 };
+  if (buildStatus.has(key)) return buildStatus.get(key);
+  const idxPath = indexPathFor(root);
+  if (!fs.existsSync(idxPath)) return { status: 'none', total: 0, done: 0 };
+  try {
+    const data = JSON.parse(fs.readFileSync(idxPath, 'utf8'));
+    return data.partial ? { status: 'incomplete', total: 0, done: 0 } : { status: 'done', total: 0, done: 0 };
+  } catch { return { status: 'none', total: 0, done: 0 }; }
 }
 
 async function search(root, query, topK = 8) {

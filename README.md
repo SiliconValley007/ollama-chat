@@ -107,7 +107,7 @@ echo "Your token: $APP_TOKEN"   # copy this for step 7
 **Windows PowerShell (only if running `node server.js` directly instead of
 `start.bat`):**
 ````powershell
-$env:APP_TOKEN = -join ((48..57)+(97..102)|Get-Random -Count 32|%{[char]$_})
+$env:APP_TOKEN = -join (1..32 | %{ '{0:x}' -f (Get-Random -Maximum 16) })
 echo "Your token: $env:APP_TOKEN"
 ````
 

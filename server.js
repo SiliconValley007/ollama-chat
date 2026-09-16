@@ -118,6 +118,9 @@ app.patch('/api/conversations/:id', (req, res) => {
 });
 
 app.delete('/api/conversations/:id', (req, res) => {
+  if (activeTurns.has(req.params.id)) {
+    return res.status(409).json({ error: 'Cannot delete a conversation with a message in flight. Wait for it to finish or stop it first.' });
+  }
   try { db.deleteConversation(req.params.id); res.json({ ok: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -201,15 +204,18 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   const files = req.files || [];
 
   if (!conversationId || (!message && files.length === 0)) {
+    for (const file of files) { try { fs.unlinkSync(file.path); } catch {} }
     return res.status(400).json({ error: 'conversationId and message or file required' });
   }
   if (activeTurns.has(conversationId)) {
+    for (const file of files) { try { fs.unlinkSync(file.path); } catch {} }
     return res.status(409).json({ error: 'This conversation already has a message in flight from another tab or device. Wait for it to finish, or stop it, before sending another.' });
-  }
-  // Claim the slot before any `await` gives a concurrent request a window to pass the check too.
+  }  // Claim the slot before any `await` gives a concurrent request a window to pass the check too.
   activeTurns.set(conversationId, { queue: [], aborted: false });
 
+  try {
   let conversation = db.getConversation(conversationId);
+
   if (!conversation) {
     conversation = db.createConversation(conversationId, req.body.model || DEFAULT_MODEL);
   }
@@ -321,6 +327,12 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   }
   historyForOllama.push({ role: 'user', content: combinedContent });
   historyForOllama = trimHistoryToBudget(historyForOllama, historyBudget);
+  } catch (err) {
+    activeTurns.delete(conversationId);
+    for (const file of files) { try { fs.unlinkSync(file.path); } catch {} }
+    log.error('[chat] setup failed:', err.message);
+    return res.status(500).json({ error: 'Chat setup failed: ' + err.message });
+  }
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -627,7 +639,7 @@ function enforceToolBudget(messages, budgetChars) {
   }
 }
 
-const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json)$/i;
+const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json|\.app_token|.*\.db)$/i;
 function toolReadFile(root, relPath) {
   if (SENSITIVE_FILE_RX.test(relPath)) return 'Error: reading this file is blocked (matches a secrets/key pattern) — this project sends file contents to a cloud-hosted model.';
   const resolved = safeResolve(root, relPath);
@@ -682,12 +694,14 @@ function stageCommandExecution(root, command, emit, conversationId) {
     emit({ type: 'command_pending', pendingId, command });
     const timeout = setTimeout(() => {
       pendingCommands.delete(pendingId);
+      emit({ type: 'command_decided', pendingId, approved: false });
       settle('Command was not approved within 5 minutes — NOT run: ' + command);
     }, 5 * 60 * 1000);
     pendingCommands.set(pendingId, {
       conversationId,
       onDecision: (approved) => {
         clearTimeout(timeout);
+        emit({ type: 'command_decided', pendingId, approved });
         if (approved) runShellCommand(root, command, settle, conversationId);
         else settle('The user rejected running this command: "' + command + '". Do not retry it — ask what they want instead.');
       }
@@ -739,6 +753,7 @@ function stageFileChange(root, relPath, opts, emit, conversationId) {
 
     const timeout = setTimeout(() => {
       pendingDiffs.delete(pendingId);
+      emit({ type: 'diff_decided', pendingId, approved: false });
       settle('Error: no response from user within 5 minutes — change to ' + relPath + ' was NOT applied.');
     }, 5 * 60 * 1000);
 
@@ -746,6 +761,7 @@ function stageFileChange(root, relPath, opts, emit, conversationId) {
       conversationId,
       onDecision: (approved) => {
         clearTimeout(timeout);
+        emit({ type: 'diff_decided', pendingId, approved });
         if (approved) writeAndSettle(' (approved by user)');
         else settle('Change to ' + relPath + ' was rejected by the user. Do not reapply the same edit — ask what they want instead.');
       }
@@ -948,7 +964,7 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
   });
 }
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db']);
 const WALK_NODE_CAP = intEnv('WALK_NODE_CAP', 20000);
 
 function walk(dir, base = dir, seen = new Set(), counter = { n: 0 }) {
@@ -976,6 +992,9 @@ function walk(dir, base = dir, seen = new Set(), counter = { n: 0 }) {
 app.post('/api/project/open', (req, res) => {
   const folderPath = req.body.path;
   if (!folderPath || !fs.existsSync(folderPath)) return res.status(400).json({ error: 'Invalid path' });
+  let stat;
+  try { stat = fs.statSync(folderPath); } catch { return res.status(400).json({ error: 'Invalid path' }); }
+  if (!stat.isDirectory()) return res.status(400).json({ error: 'Path is a file, not a folder' });
   res.json({ path: folderPath, tree: walk(folderPath) });
 });
 

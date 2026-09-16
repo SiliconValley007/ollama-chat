@@ -137,6 +137,7 @@ module.exports = {
   },
 
   deleteConversation(id) {
+    run('DELETE FROM events WHERE conversation_id = ?', [id]);
     run('DELETE FROM messages WHERE conversation_id = ?', [id]);
     run('DELETE FROM conversations WHERE id = ?', [id]);
   },
@@ -151,17 +152,17 @@ module.exports = {
   },
 
   getMessages(conversationId) {
-    return all('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC', [conversationId]);
+    return all('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC', [conversationId]);
   },
 
   addEvent(id, conversationId, type, payload) {
     run('INSERT INTO events (id, conversation_id, type, payload) VALUES (?, ?, ?, ?)', [id, conversationId, type, JSON.stringify(payload)]);
   },
   getEvents(conversationId) {
-    return all('SELECT * FROM events WHERE conversation_id = ? ORDER BY created_at ASC', [conversationId]);
+    return all('SELECT * FROM events WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC', [conversationId]);
   },
   getMessageHistory(conversationId) {
-    return all("SELECT role, content FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC", [conversationId]);
+    return all("SELECT role, content FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC, rowid ASC", [conversationId]);
   },
 
   // Delete a specific message and all messages after it (for edit/regenerate)
