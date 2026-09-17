@@ -1235,7 +1235,7 @@ async function runPreflightChecks() {
   db.init().then(() => {
     const server = app.listen(PORT, '0.0.0.0', () => {
       const tsIp = detectTailscaleIP();
-      log.info('Claude Chat running at http://localhost:' + PORT + '/?token=' + SHARED_TOKEN);
+      log.info('Ollama Chat running at http://localhost:' + PORT + '/?token=' + SHARED_TOKEN);
       if (tsIp) log.info('Tailscale (phone) URL: http://' + tsIp + ':' + PORT + '/?token=' + SHARED_TOKEN);
       log.info('Ollama endpoint: ' + OLLAMA_HOST);
       log.info('Default model: ' + DEFAULT_MODEL);

@@ -144,7 +144,7 @@ node server.js
 
 You should see:
 ```
-Claude Chat running at http://localhost:3000/?token=<your-token>
+Ollama Chat running at http://localhost:3000/?token=<your-token>
 Ollama endpoint: http://localhost:11434
 Default model: gpt-oss:120b-cloud
 ```
