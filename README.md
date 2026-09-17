@@ -1,4 +1,4 @@
-# Claude Chat — Self-Hosted AI Chat + Agentic Project Assistant
+# Ollama Chat — Self-Hosted AI Chat + Agentic Project Assistant
 
 A self-hosted, ChatGPT/Claude-style chat app that runs entirely on your
 own computer, talks to free Ollama Cloud models, and can open a project
@@ -10,10 +10,10 @@ This guide assumes **zero prior setup**. Follow it top to bottom.
 
 ## Option A: Just run the .exe (no Node.js, no git)
 
-1. Go to this repo's **Releases** page and download `claude-chat-win.exe`.
+1. Go to this repo's **Releases** page and download `ollama-chat-win.exe`.
 2. Install Ollama and pull the models (Steps 2–3 below still apply — the
    .exe still needs Ollama running locally).
-3. Double-click `claude-chat-win.exe`. A console window opens, runs
+3. Double-click `ollama-chat-win.exe`. A console window opens, runs
    pre-flight checks, then prints your local URL, Tailscale URL, and
    app token — open the local URL in your browser.
 4. `.app_token` is created next to the `.exe`, and `chats.db` is created
@@ -94,7 +94,7 @@ You should see all seven names listed.
 **If you have git installed:**
 ```
 git clone <this-repository-url>
-cd claude-chat
+cd ollama-chat
 ```
 
 **If you don't have git:** click the green "Code" button on this GitHub
@@ -236,9 +236,9 @@ Requires Node.js and this repo cloned locally.
 
 ```bash
 npm install
-npm run build:win   # Windows .exe → dist/claude-chat-win.exe
-npm run build:mac   # macOS binary → dist/claude-chat-mac
-npm run build:linux # Linux binary → dist/claude-chat-linux
+npm run build:win   # Windows .exe → dist/ollama-chat-win.exe
+npm run build:mac   # macOS binary → dist/ollama-chat-mac
+npm run build:linux # Linux binary → dist/ollama-chat-linux
 npm run build:all   # all three
 ```
 
