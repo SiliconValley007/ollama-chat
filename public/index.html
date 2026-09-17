@@ -2893,6 +2893,7 @@
       }
 
       async function saveEdit(btn, msgId) {
+        if (isStreaming) { showToast("Wait for the current response to finish first"); return; }
         const wrapper = btn.closest(".message-wrapper");
         const ta = wrapper.querySelector(".edit-textarea");
         const newText = ta.value.trim();
@@ -3582,7 +3583,7 @@
       marked.use({ renderer });
       function renderMarkdown(text) {
         try {
-          return DOMPurify.sanitize(marked.parse(text || ""));
+          return DOMPurify.sanitize(marked.parse(text || ""), { ADD_ATTR: ["onclick"] });
         } catch {
           return escHtml(text || "");
         }

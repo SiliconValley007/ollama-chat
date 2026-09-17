@@ -144,6 +144,9 @@ app.delete('/api/conversations/:id', (req, res) => {
 // ─── Edit message — truncate history at that message and re-send ───────────────
 
 app.delete('/api/conversations/:id/messages-from/:msgId', (req, res) => {
+  if (activeTurns.has(req.params.id)) {
+    return res.status(409).json({ error: 'Cannot edit/regenerate while a message is in flight. Wait for it to finish or stop it first.' });
+  }
   try {
     db.deleteMessagesFrom(req.params.id, req.params.msgId);
     res.json({ ok: true });
@@ -468,7 +471,7 @@ function sendError(msg) {
       emit({ type: 'model_used', model: usedModel });
       assistantContent = result.content;
       lastEditedFiles = result.editedFiles && result.editedFiles.length ? result.editedFiles : null;
-      res.write('data: ' + JSON.stringify({ usage: { promptTokens: result.promptTokens, evalTokens: result.evalTokens } }) + '\n\n');
+      broadcast(JSON.stringify({ usage: { promptTokens: result.promptTokens, evalTokens: result.evalTokens } }));
       finish();
     } catch (err) {
       sendError('Project chat error: ' + err.message);
