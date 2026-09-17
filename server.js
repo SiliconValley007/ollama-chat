@@ -52,12 +52,28 @@ const REQUIRE_COMMAND_APPROVAL = process.env.REQUIRE_COMMAND_APPROVAL !== 'false
 
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 25 * 1024 * 1024, files: 10, fieldSize: 5 * 1024 * 1024 } });
 
-const SHARED_TOKEN = process.env.APP_TOKEN;
-if (!SHARED_TOKEN) { log.error('APP_TOKEN env var is required — refusing to start without auth.'); process.exit(1); }
+const { APP_ROOT, isPkg } = require('./paths');
+const TOKEN_PATH = path.join(APP_ROOT, '.app_token');
+function loadOrCreateToken() {
+  if (process.env.APP_TOKEN) return process.env.APP_TOKEN;
+  try {
+    if (fs.existsSync(TOKEN_PATH)) return fs.readFileSync(TOKEN_PATH, 'utf8').trim();
+    const token = require('crypto').randomBytes(16).toString('hex');
+    fs.writeFileSync(TOKEN_PATH, token, { mode: 0o600 });
+    return token;
+  } catch (e) {
+    log.error('Could not read/create .app_token in ' + APP_ROOT + ':', e.message);
+    console.error('\n[FATAL] Cannot write to ' + APP_ROOT + '.');
+    console.error('  Move claude-chat.exe to a folder you can write to (e.g. Desktop or Documents) and relaunch.\n');
+    return null;
+  }
+}
+const SHARED_TOKEN = loadOrCreateToken();
+if (!SHARED_TOKEN) { log.error('No APP_TOKEN available — refusing to start without auth.'); process.exit(1); }
 const PUBLIC_ASSETS = new Set(['/', '/index.html', '/sw.js', '/manifest.json', '/favicon.svg', '/icon-192.png', '/icon-192.svg', '/icon-512.png', '/icon-512.svg']);
 // NOTE: all /api/* routes remain behind the token check below — only the HTML shell is public now.
 app.use((req, res, next) => {
-  if (req.path.startsWith('/vendor')) return next(); // ✅ allow static
+  if (req.path.startsWith('/vendor/')) return next(); // ✅ allow static
   if (PUBLIC_ASSETS.has(req.path)) return next();
   // Query-param fallback kept only for the one-time first-visit bootstrap link in
   // the README; the client immediately caches to localStorage/header after that.
@@ -105,7 +121,7 @@ app.get('/api/conversations/:id', (req, res) => {
   try {
     const conversation = db.getConversation(req.params.id);
     if (!conversation) return res.status(404).json({ error: 'Not found' });
-    res.json({ ...conversation, messages: db.getMessages(req.params.id) });
+    res.json({ ...conversation, messages: db.getMessages(req.params.id), activeTurn: activeTurns.has(req.params.id) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -166,6 +182,19 @@ app.get('/api/conversations/:id/export', (req, res) => {
 });
 
 // ─── Chat ─────────────────────────────────────────────────────────────────────
+app.get('/api/chat/stream/:conversationId', (req, res) => {
+  const turn = activeTurns.get(req.params.conversationId);
+  if (!turn) return res.status(404).json({ error: 'No active turn for this conversation' });
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  res.on('error', () => {});
+  turn.subscribers.add(res);
+  res.on('close', () => turn.subscribers.delete(res));
+});
+
 app.post('/api/chat/steer', (req, res) => {
   const conversationId = req.body.conversationId;
   const turn = activeTurns.get(conversationId);
@@ -211,10 +240,12 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     for (const file of files) { try { fs.unlinkSync(file.path); } catch {} }
     return res.status(409).json({ error: 'This conversation already has a message in flight from another tab or device. Wait for it to finish, or stop it, before sending another.' });
   }  // Claim the slot before any `await` gives a concurrent request a window to pass the check too.
-  activeTurns.set(conversationId, { queue: [], aborted: false });
+  activeTurns.set(conversationId, { queue: [], aborted: false, subscribers: new Set([res]) });
 
+  let conversation, projectRoot, systemContent, historyBudget, historyForOllama, combinedContent;
+  const content_parts = [], storage_lines = [];
   try {
-  let conversation = db.getConversation(conversationId);
+  conversation = db.getConversation(conversationId);
 
   if (!conversation) {
     conversation = db.createConversation(conversationId, req.body.model || DEFAULT_MODEL);
@@ -224,9 +255,6 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     db.updateConversationModel(conversationId, requestedModel);
     conversation.model = requestedModel;
   }
-
-  const content_parts = [];
-  const storage_lines = [];
 
   for (const file of files) {
     const mime = file.mimetype;
@@ -279,12 +307,12 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   const rawHistory = db.getMessageHistory(conversationId);
 
   const requestedProjectRoot = req.body.projectRoot && fs.existsSync(req.body.projectRoot) ? req.body.projectRoot : null;
-  const projectRoot = requestedProjectRoot || (conversation.project_root && fs.existsSync(conversation.project_root) ? conversation.project_root : null);
+  projectRoot = requestedProjectRoot || (conversation.project_root && fs.existsSync(conversation.project_root) ? conversation.project_root : null);
   if (requestedProjectRoot && requestedProjectRoot !== conversation.project_root) {
     db.updateConversationProjectRoot(conversationId, requestedProjectRoot);
     conversation.project_root = requestedProjectRoot;
   }
-  let systemContent = 'You are a helpful AI coding assistant.';
+  systemContent = 'You are a helpful AI coding assistant.';
   if (projectRoot) {
     const rules = loadProjectRules(projectRoot);
     const tree = walk(projectRoot);
@@ -312,15 +340,15 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   // deduct its size so history + system never exceed the intended total.
   const SYSTEM_PROMPT_CAP = Math.floor(CTX_CHAR_BUDGET * 0.20);
   if (systemContent.length > SYSTEM_PROMPT_CAP) systemContent = systemContent.slice(0, SYSTEM_PROMPT_CAP) + '\n[...tree/rules truncated to fit context budget]';
-  const historyBudget = Math.max(1000, MAX_HISTORY_CHARS - systemContent.length);
-  let historyForOllama = [{ role: 'system', content: systemContent }];
+  historyBudget = Math.max(1000, MAX_HISTORY_CHARS - systemContent.length);
+  historyForOllama = [{ role: 'system', content: systemContent }];
 
   for (let i = 0; i < rawHistory.length - 1; i++) {
     historyForOllama.push({ role: rawHistory[i].role, content: rawHistory[i].content });
   }
 
   // Always send as plain string — gpt-oss:120b-cloud does not accept array content
-  let combinedContent = content_parts.map(p => p.text || '').join('\n').trim();
+  combinedContent = content_parts.map(p => p.text || '').join('\n').trim();
   const CURRENT_TURN_CHAR_CAP = Math.floor(historyBudget * 0.9);
   if (combinedContent.length > CURRENT_TURN_CHAR_CAP) {
     combinedContent = combinedContent.slice(0, CURRENT_TURN_CHAR_CAP) + '\n[...truncated: attachments + message exceeded the context budget]';
@@ -339,6 +367,10 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+  // A write can still land after the client socket is destroyed (page reload/close
+  // racing with an in-flight ollamaRes 'data' event) — without this listener that
+  // 'error' is unhandled and becomes a process-killing uncaughtException.
+  res.on('error', (err) => { log.warn('[chat] response write after disconnect:', err.message); });
 
   const assistantMsgId = uuidv4();
   let assistantContent = '';
@@ -347,12 +379,17 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   let lastEditedFiles = null;
   let ollamaReq;
   res.on('close', () => {
+    if (finished) return; // normal completion already handled everything — a late/duplicate
+                           // 'close' must never touch a NEW turn's pending diffs/commands.
     userAborted = true;
-    if (!finished) ollamaReq?.destroy();
+    ollamaReq?.destroy();
     const turn = activeTurns.get(conversationId);
     if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
-    for (const [id, p] of pendingDiffs) if (p.conversationId === conversationId) { pendingDiffs.delete(id); p.onDecision(false); }
-    for (const [id, p] of pendingCommands) if (p.conversationId === conversationId) { pendingCommands.delete(id); p.onDecision(false); }
+    // Deliberately NOT force-rejecting pendingDiffs/pendingCommands here: this handler
+    // fires on a page reload/tab close as well as an explicit Stop, and reload should let
+    // the user still approve/reject from the reopened chat (the pendingId survives
+    // independently of this connection). Genuine abandonment is still bounded by the
+    // existing 5-minute timeout in stageFileChange/stageCommandExecution.
     // Save whatever partial reply had streamed in so far, and still set the
     // conversation title — otherwise a stopped response vanishes on refresh
     // and the chat stays named "New Chat" forever.
@@ -360,53 +397,70 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   });
 
   function finish() {
-    activeTurns.delete(conversationId);
-    if (finished) return;
+    if (finished) { activeTurns.delete(conversationId); return; }
     finished = true;
-    if (assistantContent) {
-      db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent, lastEditedFiles);
+        if (assistantContent || lastEditedFiles) {
+      db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent || 'Done.', lastEditedFiles);
       if (conversation.title === 'New Chat') {
         db.updateConversationTitle(conversationId, generateTitle(message || storage_lines[0] || 'File upload'));
       }
       db.flushSync(); // durability point — a completed reply must survive a crash, not wait on the debounce
     }
-    if (!res.writableEnded) {
-      res.write('data: ' + JSON.stringify({ done: true, messageId: assistantMsgId, conversationId }) + '\n\n');
-      res.end();
+    const t0 = activeTurns.get(conversationId);
+    const subs = t0 ? [...t0.subscribers] : [res];
+    activeTurns.delete(conversationId);
+    for (const sub of subs) {
+      if (!sub.writableEnded) { sub.write('data: ' + JSON.stringify({ done: true, messageId: assistantMsgId, conversationId }) + '\n\n'); sub.end(); }
     }
   }
 
 function sendError(msg) {
-  activeTurns.delete(conversationId);
-  if (assistantContent && !finished) {
+  if ((assistantContent || lastEditedFiles) && !finished) {
     finished = true;
     db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent, lastEditedFiles);
     if (conversation.title === 'New Chat') {
       db.updateConversationTitle(conversationId, generateTitle(message || storage_lines[0] || 'File upload'));
     }
   }
-  if (!res.writableEnded) { res.write('data: ' + JSON.stringify({ error: msg }) + '\n\n'); res.end(); }
+  const t1 = activeTurns.get(conversationId);
+  const subs1 = t1 ? [...t1.subscribers] : [res];
+  activeTurns.delete(conversationId);
+  for (const sub of subs1) { if (!sub.writableEnded) { sub.write('data: ' + JSON.stringify({ error: msg }) + '\n\n'); sub.end(); } }
 }
+
+    function broadcast(line) {
+      const t = activeTurns.get(conversationId);
+      for (const sub of (t ? t.subscribers : [res])) {
+        if (!sub.writableEnded) sub.write('data: ' + line + '\n\n');
+        else if (t) t.subscribers.delete(sub);
+      }
+    }
 
     if (projectRoot) {
     try {
       const emit = (evt) => {
-        // Accumulate as tokens stream so an abort mid tool-loop still has content
-        // to persist in finish(); clear on stream_reset since that content was discarded.
         if (evt.token) assistantContent += evt.token;
         if (evt.type === 'stream_reset') assistantContent = '';
         if (evt.type) db.addEvent(uuidv4(), conversationId, evt.type, evt);
-        if (!res.writableEnded) res.write('data: ' + JSON.stringify(evt) + '\n\n');
+        const line = 'data: ' + JSON.stringify(evt) + '\n\n';
+        const t = activeTurns.get(conversationId);
+        for (const sub of (t ? t.subscribers : [res])) {
+          if (!sub.writableEnded) sub.write(line);
+          else if (t) t.subscribers.delete(sub);
+        }
       };
       const turnRef = activeTurns.get(conversationId);
       if (turnRef) turnRef.emit = emit;
       let result, usedModel = conversation.model || DEFAULT_MODEL;
       const chain = [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)];
       let lastErr;
-      const sharedMessages = historyForOllama.slice();
+      // Fresh copy per attempt — resolveToolCalls mutates its `messages` arg in place,
+      // so reusing one array across fallback attempts leaks a failed model's partial
+      // tool-call transcript into the next model's context. editedFiles is real disk
+      // state, not conversation state, so that Set is intentionally still shared.
       const sharedEditedFiles = new Set();
       for (const m of chain) {
-        try { result = await resolveToolCalls(sharedMessages, projectRoot, m, conversationId, emit, sharedEditedFiles); usedModel = m; break; }
+        try { result = await resolveToolCalls(historyForOllama.slice(), projectRoot, m, conversationId, emit, sharedEditedFiles); usedModel = m; break; }
         catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
       }
       if (!result) throw lastErr || new Error('All models exhausted');
@@ -467,7 +521,7 @@ function sendError(msg) {
         db.updateConversationModel(conversationId, model);
         conversation.model = model;
       }
-      if (!res.writableEnded) res.write('data: ' + JSON.stringify({ model_used: model }) + '\n\n');
+      broadcast(JSON.stringify({ model_used: model }));
 
       let lineBuffer = '';
       ollamaRes.on('data', (chunk) => {
@@ -483,10 +537,10 @@ function sendError(msg) {
             const data = JSON.parse(trimmed);
             if (data.message && data.message.content) {
               assistantContent += data.message.content;
-              if (!res.writableEnded) res.write('data: ' + JSON.stringify({ token: data.message.content }) + '\n\n');
+              broadcast(JSON.stringify({ token: data.message.content }));
             }
             if (data.done === true) {
-              res.write('data: ' + JSON.stringify({ usage: { promptTokens: data.prompt_eval_count || 0, evalTokens: data.eval_count || 0 } }) + '\n\n');
+              broadcast(JSON.stringify({ usage: { promptTokens: data.prompt_eval_count || 0, evalTokens: data.eval_count || 0 } }));
               finish();
             }
           } catch (_) {}
@@ -639,7 +693,7 @@ function enforceToolBudget(messages, budgetChars) {
   }
 }
 
-const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json|\.app_token|.*\.db)$/i;
+const { SENSITIVE_FILE_RX } = require('./codeIndex');
 function toolReadFile(root, relPath) {
   if (SENSITIVE_FILE_RX.test(relPath)) return 'Error: reading this file is blocked (matches a secrets/key pattern) — this project sends file contents to a cloud-hosted model.';
   const resolved = safeResolve(root, relPath);
@@ -662,7 +716,7 @@ const SHELL_BLOCKLIST = [
 
 function killProcessTree(child) {
   if (!child || !child.pid || child.killed) return;
-  if (process.platform === 'win32') { try { execFile('taskkill', ['/pid', String(child.pid), '/T', '/F']); } catch {} }
+  if (process.platform === 'win32') { try { execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {}).on('error', () => {}); } catch {} }
   else { try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} } }
 }
 
@@ -836,7 +890,7 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
           result = 'Error: unknown tool ' + call.function.name;
         }
       } catch (e) { result = 'Error: ' + e.message; }
-      emit({ type: 'tool_end', callId, tool: call.function.name, ms: Date.now() - startedAt, ok: !result.startsWith('Error'), preview: (result || '').slice(0, 300) });
+      emit({ type: 'tool_end', callId, tool: call.function.name, ms: Date.now() - startedAt, ok: !result.startsWith('Error') && !result.startsWith('No index found'), preview: (result || '').slice(0, 300) });
       messages.push({ role: 'tool', content: result, tool_call_id: call.id || callId });
     }
     if (touchedFiles) codeIndex.buildIndex(projectRoot).catch(() => {}); // fire-and-forget, now the edits are actually on disk
@@ -964,7 +1018,7 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
   });
 }
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db']);
+const { IGNORE_DIRS } = require('./codeIndex'); // single source of truth, shared with the indexer
 const WALK_NODE_CAP = intEnv('WALK_NODE_CAP', 20000);
 
 function walk(dir, base = dir, seen = new Set(), counter = { n: 0 }) {
@@ -1124,23 +1178,87 @@ function trimHistoryToBudget(history, maxChars) {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-db.init().then(() => {
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    log.info('Claude Chat running at http://0.0.0.0:' + PORT);
-    log.info('Ollama endpoint: ' + OLLAMA_HOST);
-    log.info('Default model: ' + DEFAULT_MODEL);
+function waitForKeyThenExit(code) {
+  if (!isPkg) return process.exit(code);
+  console.log('\nPress any key to exit...');
+  try { process.stdin.setRawMode(true); } catch {}
+  process.stdin.resume();
+  process.stdin.once('data', () => process.exit(code));
+}
 
-    let shuttingDown = false;
-    function shutdown() {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      log.info('Shutting down: closing active streams and flushing database...');
-      for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
-      try { db.flushSync(); } catch (e) { log.error('DB flush failed:', e.message); }
-      server.close(() => { log.info('Shutdown complete.'); process.exit(0); });
-      setTimeout(() => process.exit(0), 2000); // force-exit if something hangs
+function detectTailscaleIP() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const addr of ifaces[name]) {
+      if (addr.family === 'IPv4' && !addr.internal && addr.address.startsWith('100.')) return addr.address;
     }
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+  }
+  return null;
+}
+
+function checkOllama() {
+  return new Promise(resolve => {
+    const u = new URL(OLLAMA_HOST + '/api/tags');
+    const mod = u.protocol === 'https:' ? require('https') : require('http');
+    const r = mod.get({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname, timeout: 4000 }, res => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => { try { resolve({ ok: true, models: (JSON.parse(data).models || []).map(m => m.name) }); } catch { resolve({ ok: true, models: [] }); } });
+    });
+    r.on('timeout', () => { r.destroy(); resolve({ ok: false }); });
+    r.on('error', () => resolve({ ok: false }));
   });
-}).catch(err => { log.error('Database init failed:', err.message); process.exit(1); });
+}
+
+async function runPreflightChecks() {
+  log.info('Running pre-flight checks...');
+  const result = await checkOllama();
+  if (!result.ok) {
+    console.error('\n[FATAL] Cannot reach Ollama at ' + OLLAMA_HOST);
+    console.error('  1. Install Ollama:  https://ollama.com/download');
+    console.error('  2. Start it (open the Ollama app, or run "ollama serve")');
+    console.error('  3. Run "ollama signin" and pull the models listed in README.md');
+    console.error('  Then relaunch this app.\n');
+    waitForKeyThenExit(1);
+    return false;
+  }
+  if (!result.models.some(m => m.startsWith('nomic-embed-text'))) {
+    console.warn('[WARN] nomic-embed-text not found — run "ollama pull nomic-embed-text" to enable semantic code search.\n');
+  }
+  return true;
+}
+
+(async () => {
+  if (!(await runPreflightChecks())) return;
+  db.init().then(() => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      const tsIp = detectTailscaleIP();
+      log.info('Claude Chat running at http://localhost:' + PORT + '/?token=' + SHARED_TOKEN);
+      if (tsIp) log.info('Tailscale (phone) URL: http://' + tsIp + ':' + PORT + '/?token=' + SHARED_TOKEN);
+      log.info('Ollama endpoint: ' + OLLAMA_HOST);
+      log.info('Default model: ' + DEFAULT_MODEL);
+
+      let shuttingDown = false;
+      function shutdown() {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        log.info('Shutting down: closing active streams and flushing database...');
+        for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
+        try { db.flushSync(); } catch (e) { log.error('DB flush failed:', e.message); }
+        server.close(() => { log.info('Shutdown complete.'); process.exit(0); });
+        setTimeout(() => process.exit(0), 2000);
+      }
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+    });
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error('\n[FATAL] Port ' + PORT + ' is already in use.');
+        console.error('  Close the other app using it, or set PORT=xxxx and relaunch.\n');
+        waitForKeyThenExit(1);
+      } else {
+        log.error('Server error:', err.message);
+        waitForKeyThenExit(1);
+      }
+    });
+  }).catch(err => { log.error('Database init failed:', err.message); waitForKeyThenExit(1); });
+})();

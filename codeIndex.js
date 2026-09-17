@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { APP_ROOT } = require('./paths');
 
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 const CHUNK_LINES = 60;
@@ -22,7 +23,7 @@ function normRoot(root) {
 
 function indexPathFor(root) {
   const hash = crypto.createHash('sha1').update(normRoot(root)).digest('hex').slice(0, 12);
-  const dir = path.join(__dirname, 'db', 'code-index');
+  const dir = path.join(APP_ROOT, 'db', 'code-index');
   fs.mkdirSync(dir, { recursive: true });
   return path.join(dir, hash + '.json');
 }
@@ -66,19 +67,28 @@ function chunkFile(content) {
   return chunks;
 }
 
-async function embed(text) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 30000);
-  try {
-    const r = await fetch((process.env.OLLAMA_HOST || 'http://localhost:11434') + '/api/embeddings', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 8000) }),
-      signal: controller.signal
+function embed(text) {
+  return new Promise((resolve, reject) => {
+    const u = new URL((process.env.OLLAMA_HOST || 'http://localhost:11434') + '/api/embeddings');
+    const mod = u.protocol === 'https:' ? require('https') : require('http');
+    const payload = JSON.stringify({ model: EMBED_MODEL, prompt: text.slice(0, 8000) });
+    const req = mod.request({
+      hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: 30000
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error('Embedding request failed: ' + res.statusCode));
+        try { resolve(JSON.parse(data).embedding); } catch (e) { reject(e); }
+      });
     });
-    if (!r.ok) throw new Error('Embedding request failed: ' + r.status);
-    const data = await r.json();
-    return data.embedding;
-  } finally { clearTimeout(t); }
+    req.on('timeout', () => { req.destroy(); reject(new Error('Embedding request timed out')); });
+    req.on('error', reject);
+    req.write(payload); req.end();
+  });
 }
 
 function cosineSim(a, b) {
@@ -122,28 +132,49 @@ async function buildIndex(root) {
     buildStatus.set(key, { status: 'running', total: totalChunks, done: 0 });
 
     let done = 0;
+    let sinceCheckpoint = 0; // counts embeds since the last on-disk checkpoint — avoids the % modulo racing across concurrent workers
+    const jobs = []; // flat list of { f, c, hash } for every chunk that needs embedding
     for (const { f, chunks, hash } of perFileChunks) {
       const cached = hash && prevByPath.get(f);
       if (cached && cached.length && cached[0].fileHash === hash) {
         entries.push(...cached);
         done += chunks.length;
-        buildStatus.set(key, { status: 'running', total: totalChunks, done });
         continue;
       }
-      for (const c of chunks) {
+      for (const c of chunks) jobs.push({ f, c, hash });
+    }
+    buildStatus.set(key, { status: 'running', total: totalChunks, done });
+
+    // EMBED_CONCURRENCY: how many /api/embeddings requests are in flight at once.
+    // Ollama serializes/queues on its own side per model, so this mainly overlaps
+    // network + JSON overhead — keep modest to avoid saturating the local box.
+    const EMBED_CONCURRENCY = parseInt(process.env.EMBED_CONCURRENCY || '4', 10);
+    let cursor = 0;
+    let checkpointing = Promise.resolve(); // serializes atomicWriteJSON calls so two workers never interleave a write
+
+    async function worker() {
+      while (cursor < jobs.length) {
+        const { f, c, hash } = jobs[cursor++];
         try {
           const vector = await embed(c.text);
           entries.push({ path: f, startLine: c.startLine, endLine: c.endLine, text: c.text, vector, fileHash: hash });
         } catch (e) { console.warn('[codeIndex] embed failed for', f, e.message); }
         done++;
+        sinceCheckpoint++;
         buildStatus.set(key, { status: 'running', total: totalChunks, done });
-        // Checkpoint every 200 chunks — bounds data loss on crash/restart to one
-        // checkpoint interval instead of the entire (potentially hours-long) build.
-        if (done % 200 === 0) {
-          try { atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries, partial: true }); } catch {}
+        if (sinceCheckpoint >= 200) {
+          sinceCheckpoint -= 200;
+          // Chain onto checkpointing so concurrent workers hitting this at once
+          // still produce one write at a time (fs.renameSync is atomic per-call,
+          // but two overlapping writers could still interleave tmp-file contents).
+          checkpointing = checkpointing.then(() =>
+            atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries, partial: true })
+          ).catch(() => {});
         }
       }
     }
+    await Promise.all(Array.from({ length: Math.min(EMBED_CONCURRENCY, jobs.length) }, worker));
+    await checkpointing; // make sure the last in-flight checkpoint write finished before the final write below
     atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries });
     buildStatus.set(key, { status: 'done', total: totalChunks, done: totalChunks });
   } catch (e) {
@@ -172,4 +203,4 @@ async function search(root, query, topK = 8) {
   return scored.slice(0, topK).map(e => ({ path: e.path, startLine: e.startLine, endLine: e.endLine, text: e.text, score: Math.round(e.score * 1000) / 1000 }));
 }
 
-module.exports = { buildIndex, getStatus, search };
+module.exports = { buildIndex, getStatus, search, SENSITIVE_FILE_RX, IGNORE_DIRS };

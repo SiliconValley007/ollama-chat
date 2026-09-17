@@ -1829,6 +1829,8 @@
           const r = await fetch("/api/health");
           if (r.status === 401) {
             localStorage.removeItem("app_token");
+            window.__APP_TOKEN = "";
+            tokenPromptShown = false;
             setStatus("offline");
             document.getElementById("model-badge").textContent = "invalid token";
             return;
@@ -1836,27 +1838,32 @@
           if (!r.ok) { throw new Error("Health check failed (" + r.status + ")"); }
           const health = await r.json();
           if (health.ollamaReachable === false) {
-            setStatus("offline");
-            document.getElementById("model-badge").textContent = "Ollama not running";
+            if (!isStreaming) {
+              setStatus("offline");
+              document.getElementById("model-badge").textContent = "Ollama not running";
+            }
           } else {
-            setStatus("online");
+            if (!isStreaming) setStatus("online");
             const badge = document.getElementById("model-badge");
             if (["offline", "Ollama not running", "invalid token"].includes(badge.textContent)) {
               badge.textContent = currentModel;
             }
           }
-          loadModels();
+          const __reqId = (window.__modelsReqId = (window.__modelsReqId || 0) + 1);
+          loadModels(__reqId);
         } catch {
           setStatus("offline");
           document.getElementById("model-badge").textContent = "offline";
         }
       }
 
-      async function loadModels() {
+      async function loadModels(reqId) {
         try {
           const r = await fetch("/api/models");
           if (!r.ok) { throw new Error("Failed to load models"); }
-          availableModels = await r.json();
+          const models = await r.json();
+          if (reqId !== undefined && reqId !== window.__modelsReqId) return; // stale — a newer checkHealth() call superseded this one
+          availableModels = models;
           renderModelDropdown();
         } catch {}
       }
@@ -2387,6 +2394,37 @@
             data.title;
           document.getElementById("export-btn").style.display = "flex";
           renderMessages(data.messages, rawEvents);
+          window.__resumeIfActive = async function (id) {
+            try {
+              const resp = await fetch("/api/chat/stream/" + id);
+              if (!resp.ok) return; // 404 = nothing in flight, normal case
+              setStreaming(true);
+              const reader = resp.body.getReader();
+              const decoder = new TextDecoder();
+              let partial = "";
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                partial += decoder.decode(value, { stream: true });
+                const lines = partial.split("\n");
+                partial = lines.pop();
+                for (const line of lines) {
+                  if (!line.startsWith("data: ")) continue;
+                  try {
+                    const evt = JSON.parse(line.slice(6));
+                    if (evt.done || evt.error) {
+                      if (id === currentConvId) await loadConversation(id);
+                      setStreaming(false);
+                      return;
+                    }
+                  } catch {}
+                }
+              }
+              if (id === currentConvId) await loadConversation(id);
+              setStreaming(false);
+            } catch { setStreaming(false); }
+          };
+          if (data.activeTurn) window.__resumeIfActive(id);
           closeSidebar();
         } catch {
           showToast("Failed to load conversation");
@@ -2476,6 +2514,7 @@
             await fetch("/api/conversations/" + id, { method: "DELETE" });
             if (currentConvId === id) startNewChat();
             await loadConversations();
+            window.__resumeIfActive?.(currentConvId);
             showToast("Conversation deleted");
           },
         );
@@ -3321,6 +3360,7 @@
                 if (data.done) {
                   receivedDone = true;
                   newMsgId = data.messageId;
+                  if (typingEl.parentNode && !streamWrapper) typingEl.remove();
                   if (streamBubble) {
                     streamBubble.classList.remove("streaming-cursor");
                     streamBubble.innerHTML = renderMarkdown(buffer);
@@ -3371,7 +3411,20 @@
           if (statusDetail.parentNode) statusDetail.remove();
           if (err.name === "AbortError") {
             if (typingEl.parentNode) typingEl.remove();
-            if (streamBubble) streamBubble.classList.remove("streaming-cursor");
+            if (streamBubble) {
+              streamBubble.classList.remove("streaming-cursor");
+              try {
+                const conv = await fetch("/api/conversations/" + currentConvId).then(r => r.json());
+                const last = conv.messages[conv.messages.length - 1];
+                if (last && last.role === "assistant" && streamWrapper) {
+                  streamWrapper.dataset.msgId = last.id;
+                  streamWrapper.querySelector(".msg-actions").innerHTML =
+                    '<button class="msg-action" onclick="copyMessage(this)">📋 Copy</button>' +
+                    '<button class="msg-action" onclick="regenerateFrom(\'' + last.id + '\')">🔄 Regenerate</button>';
+                  lastAssistantMsgId = last.id;
+                }
+              } catch {}
+            }
           } else {
             if (typingEl.parentNode) typingEl.remove();
             appendErrorMessage("Connection error: " + err.message);

@@ -13,7 +13,7 @@ self.addEventListener('fetch', e => {
   if (e.request.url.includes('/api/')) return;
   // HTML: network-first so index.html edits always take effect; fall back to cache offline
   if (e.request.mode === 'navigate' || e.request.destination === 'document') {
-    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    e.respondWith(fetch(e.request).catch(() => caches.match('/', { ignoreSearch: true })));
     return;
   }
   // Other shell assets: cache first, fallback to network

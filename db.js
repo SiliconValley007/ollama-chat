@@ -1,8 +1,9 @@
 const initSqlJs = require('sql.js');
 const path = require('path');
 const fs = require('fs');
+const { APP_ROOT } = require('./paths');
 
-const DB_DIR = path.join(__dirname, 'db');
+const DB_DIR = path.join(APP_ROOT, 'db');
 if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
@@ -15,7 +16,9 @@ async function getDb() {
   if (_db) return _db;
   if (_ready) return _ready;
   _ready = (async () => {
-    const SQL = await initSqlJs();
+    const SQL = await initSqlJs({
+      locateFile: file => path.join(path.dirname(require.resolve('sql.js/dist/sql-wasm.js')), file)
+    });
     _db = fs.existsSync(DB_PATH)
       ? new SQL.Database(fs.readFileSync(DB_PATH))
       : new SQL.Database();

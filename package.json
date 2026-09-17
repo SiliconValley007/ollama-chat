@@ -6,8 +6,20 @@
   "engines": {
     "node": ">=18.0.0"
   },
+  "bin": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build:win": "pkg . --targets node18-win-x64 --output dist/claude-chat-win.exe",
+    "build:mac": "pkg . --targets node18-macos-x64 --output dist/claude-chat-mac",
+    "build:linux": "pkg . --targets node18-linux-x64 --output dist/claude-chat-linux",
+    "build:all": "npm run build:win && npm run build:mac && npm run build:linux"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*",
+      "node_modules/sql.js/dist/sql-wasm.wasm"
+    ],
+    "outputPath": "dist"
   },
   "overrides": {
     "qs": ">=6.16.0"
@@ -20,5 +32,8 @@
     "pdf-parse": "^1.1.1",
     "sql.js": "^1.14.2",
     "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^5.16.0"
   }
 }

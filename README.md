@@ -8,6 +8,24 @@ This guide assumes **zero prior setup**. Follow it top to bottom.
 
 ---
 
+## Option A: Just run the .exe (no Node.js, no git)
+
+1. Go to this repo's **Releases** page and download `claude-chat-win.exe`.
+2. Install Ollama and pull the models (Steps 2–3 below still apply — the
+   .exe still needs Ollama running locally).
+3. Double-click `claude-chat-win.exe`. A console window opens, runs
+   pre-flight checks, then prints your local URL, Tailscale URL, and
+   app token — open the local URL in your browser.
+4. `.app_token` is created next to the `.exe`, and `chats.db` is created
+   in a `db\` subfolder next to the `.exe`, on first run. To reset
+   everything, delete `.app_token` and the `db\` folder.
+
+If the window shows a `[FATAL]` message and closes only after you press
+a key, it means Ollama isn't installed or isn't running — follow the
+printed instructions, then relaunch.
+
+## Option B: Run from source (developers)
+
 ## 1. Install Node.js
 
 Node.js runs the app's server.
@@ -94,9 +112,9 @@ couple minutes).
 
 ## 6. Start the app
 
-The server requires an `APP_TOKEN` to be set — it will refuse to start
-without it. **Windows:** `start.bat` generates one for you automatically —
-skip this box.
+The server auto-generates `.app_token` on first run if `APP_TOKEN` isn't
+set — you don't need to set anything manually. **Windows:** `start.bat`
+also does this for you automatically — skip this box.
 **Mac/Linux, using `start.sh`:** nothing to do — `start.sh` generates `.app_token`
 automatically (like `start.bat`) and prints the full URL with the token included.
 **Mac/Linux, only if running `node server.js` directly (not `start.sh`):** set it yourself:
@@ -126,7 +144,7 @@ node server.js
 
 You should see:
 ```
-Claude Chat running at http://0.0.0.0:3000
+Claude Chat running at http://localhost:3000/?token=<your-token>
 Ollama endpoint: http://localhost:11434
 Default model: gpt-oss:120b-cloud
 ```
@@ -211,3 +229,22 @@ without interruption.
    run `$env:PORT=3001; node server.js` (Windows PowerShell) / `set PORT=3001&&node server.js`
   (Windows CMD) / `PORT=3001 node server.js` (Mac/Linux) and open `http://localhost:3001/?token=<token>` instead.
 - **"Unauthorized" / 401 errors** → your URL is missing `?token=<token>`, or you're using an old cached token after regenerating `.app_token`/re-exporting `APP_TOKEN`. Clear it with `localStorage.removeItem("app_token")` in the browser console, then reopen with the correct `?token=`.
+
+## Building your own standalone executable
+
+Requires Node.js and this repo cloned locally.
+
+```bash
+npm install
+npm run build:win   # Windows .exe → dist/claude-chat-win.exe
+npm run build:mac   # macOS binary → dist/claude-chat-mac
+npm run build:linux # Linux binary → dist/claude-chat-linux
+npm run build:all   # all three
+```
+
+The output is fully standalone — Node.js is embedded, and `public/`
+plus `sql.js`'s WebAssembly file are bundled in via the `pkg` config in
+`package.json`. Only Ollama remains an external runtime requirement.
+`.app_token` and the `db\` folder (containing `chats.db`) are always
+written next to the compiled binary (see `paths.js`/`db.js`), never
+inside the binary itself.

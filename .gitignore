@@ -1,6 +1,7 @@
-.vscode/ 
-db/ 
-node_modules/ 
-*.log 
-.env 
+.vscode/
+db/
+node_modules/
+dist/
+*.log
+.env
 .app_token
