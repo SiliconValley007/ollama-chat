@@ -1,7 +1,7 @@
 {
-  "name": "claude-chat",
+  "name": "ollama-chat",
   "version": "1.0.0",
-  "description": "Self-hosted Claude chat UI with history",
+  "description": "Self-hosted Ollama chat UI with history",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0"
@@ -9,9 +9,9 @@
   "bin": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build:win": "pkg . --targets node18-win-x64 --output dist/claude-chat-win.exe",
-    "build:mac": "pkg . --targets node18-macos-x64 --output dist/claude-chat-mac",
-    "build:linux": "pkg . --targets node18-linux-x64 --output dist/claude-chat-linux",
+    "build:win": "pkg . --targets node18-win-x64 --output dist/ollama-chat-win.exe",
+    "build:mac": "pkg . --targets node18-macos-x64 --output dist/ollama-chat-mac",
+    "build:linux": "pkg . --targets node18-linux-x64 --output dist/ollama-chat-linux",
     "build:all": "npm run build:win && npm run build:mac && npm run build:linux"
   },
   "pkg": {

@@ -1,12 +1,12 @@
 @echo off
-title Claude Chat Server
+title Ollama Chat Server
 setlocal EnableDelayedExpansion
 
 :: Always run from the folder where this bat file lives
 cd /d "%~dp0"
 
 echo ================================
-echo   Claude Chat - Local Server
+echo   Ollama Chat - Local Server
 echo ================================
 echo.
 

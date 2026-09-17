@@ -64,7 +64,7 @@ function loadOrCreateToken() {
   } catch (e) {
     log.error('Could not read/create .app_token in ' + APP_ROOT + ':', e.message);
     console.error('\n[FATAL] Cannot write to ' + APP_ROOT + '.');
-    console.error('  Move claude-chat.exe to a folder you can write to (e.g. Desktop or Documents) and relaunch.\n');
+    console.error('  Move ollama-chat.exe to a folder you can write to (e.g. Desktop or Documents) and relaunch.\n');
     return null;
   }
 }
@@ -165,7 +165,7 @@ app.get('/api/conversations/:id/export', (req, res) => {
     let content = '';
     if (fmt === 'md') {
       content = '# ' + conversation.title + '\n\n';
-      content += '_Exported from Claude Chat — ' + new Date().toLocaleString() + '_\n\n---\n\n';
+      content += '_Exported from Ollama Chat — ' + new Date().toLocaleString() + '_\n\n---\n\n';
       for (const m of messages) {
         content += '**' + (m.role === 'user' ? 'You' : 'Assistant') + ':**\n\n' + m.content + '\n\n---\n\n';
       }
@@ -640,7 +640,7 @@ app.get('/api/models', (req, res) => {
 });
 
 function loadProjectRules(root) {
-  const candidates = ['CLAUDE.md', '.cursorrules', '.cursor/rules.md'];
+  const candidates = ['Ollama.md', '.cursorrules', '.cursor/rules.md'];
   for (const rel of candidates) {
     const p = path.join(root, rel);
     if (fs.existsSync(p)) {

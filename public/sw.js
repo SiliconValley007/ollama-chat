@@ -1,5 +1,5 @@
 // Service Worker for PWA — cache shell assets for offline
-const CACHE = 'claude-chat-v4';
+const CACHE = 'Ollama-chat-v4';
 const SHELL = ['/', '/manifest.json', '/favicon.svg'];
 
 self.addEventListener('install', e => {

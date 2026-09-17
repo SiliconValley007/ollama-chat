@@ -1,6 +1,6 @@
 {
-  "name": "Claude Chat",
-  "short_name": "Claude",
+  "name": "Ollama Chat",
+  "short_name": "Ollama",
   "description": "Personal AI chat interface",
   "start_url": "/",
   "display": "standalone",
