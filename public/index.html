@@ -2900,10 +2900,15 @@
         if (!newText) return;
 
         // Delete this message and everything after it from DB
-        await fetch(
+        const delRes = await fetch(
           "/api/conversations/" + currentConvId + "/messages-from/" + msgId,
           { method: "DELETE" },
         );
+        if (!delRes.ok) {
+          const e = await delRes.json().catch(() => ({}));
+          showToast(e.error || "Could not edit — try again");
+          return;
+        }
 
         // Remove all message wrappers from this point onward in the DOM
         const inner = document.getElementById("messages-inner");
@@ -2967,10 +2972,15 @@
 
         // Delete the user turn being resent AND everything after it (including
         // the assistant reply) so we don't leave a duplicate user message behind.
-        await fetch(
+        const delRes = await fetch(
           "/api/conversations/" + currentConvId + "/messages-from/" + lastMsgId,
           { method: "DELETE" },
         );
+        if (!delRes.ok) {
+          const e = await delRes.json().catch(() => ({}));
+          showToast(e.error || "Could not regenerate — try again");
+          return;
+        }
         allWrappers.slice(userIdx).forEach((w) => w.remove());
 
         document.getElementById("message-input").value = lastContent;
@@ -3573,7 +3583,7 @@
         return (
           '<pre><div class="code-header"><span>' +
           escHtml(language) +
-          '</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div><code class="hljs language-' +
+          '</span><button class="copy-btn" data-copy-btn>📋 Copy</button></div><code class="hljs language-' +
           escHtml(language) +
           '">' +
           highlighted +
@@ -3581,9 +3591,13 @@
         );
       };
       marked.use({ renderer });
+      document.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-copy-btn]");
+        if (btn) copyCode(btn);
+      });
       function renderMarkdown(text) {
         try {
-          return DOMPurify.sanitize(marked.parse(text || ""), { ADD_ATTR: ["onclick"] });
+          return DOMPurify.sanitize(marked.parse(text || ""));
         } catch {
           return escHtml(text || "");
         }
