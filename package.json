@@ -19,7 +19,8 @@
       "public/**/*",
       "node_modules/sql.js/dist/sql-wasm.wasm"
     ],
-    "outputPath": "dist"
+    "outputPath": "dist",
+    "scripts": ["node_modules/pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js"]
   },
   "overrides": {
     "qs": ">=6.16.0"

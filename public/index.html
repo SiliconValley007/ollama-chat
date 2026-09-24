@@ -20,21 +20,17 @@
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%239b4dff'/><text y='.9em' font-size='72' x='12'>✦</text></svg>"
     />
     <title>Ollama Chat</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
+    <link rel="stylesheet" href="/vendor/fonts.css" />
     <script src="/vendor/marked.min.js"></script>
     <script src="/vendor/purify.min.js"></script>
     <link
       rel="stylesheet"
-      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+      href="/vendor/hljs-dark.css"
       id="hljs-theme"
     />
     <link
       rel="stylesheet"
-      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"
+      href="/vendor/hljs-light.css"
       id="hljs-theme-light"
       disabled
     />
@@ -61,6 +57,8 @@
         --radius: 12px;
         --font: "Sora", sans-serif;
         --mono: "JetBrains Mono", monospace;
+        --font-mono: var(--mono);
+        --text-dim: var(--text3);
       }
       .light-theme {
         --bg: #f5f5f7;
@@ -1432,46 +1430,13 @@
           #input-area{padding:6px 8px;}
           .msg-attachments img{max-width:180px;}
           .msg-actions{opacity:1;}
+          .hide-mobile{display:none;}
           #message-input{min-height:44px;padding:15px 6px;font-size:12px;line-height:1.4;}
           #send-btn,#stop-btn{width:34px;height:34px;margin:4px;}
           #attach-btn{padding:8px 4px 8px 8px;}
           #input-box-outer{border-radius:12px;}
           #input-footer{display:none;}
         }
-        #sidebar.open {
-          transform: translateX(0);
-        }
-        #sidebar-overlay.visible {
-          display: block;
-        }
-        #menu-toggle {
-          display: flex;
-        }
-        #main {
-          width: 100%;
-        }
-        #messages-inner {
-          padding: 16px 12px;
-        }
-        .msg-bubble {
-          padding: 10px 13px;
-        }
-        #topbar {
-          padding: 0 10px;
-        }
-        .welcome-title {
-          font-size: 20px;
-        }
-        #input-area {
-          padding: 8px 10px;
-        }
-        .msg-attachments img {
-          max-width: 180px;
-        }
-        .msg-actions {
-          opacity: 1;
-        }
-      }
     </style>
   </head>
   <body>
@@ -1826,7 +1791,9 @@
             };
           }
           window.__APP_TOKEN = APP_TOKEN;
+          const __hSeq = (window.__healthSeq = (window.__healthSeq || 0) + 1);
           const r = await fetch("/api/health");
+          if (__hSeq !== window.__healthSeq) return; // newer poll already answered
           if (r.status === 401) {
             localStorage.removeItem("app_token");
             window.__APP_TOKEN = "";
@@ -1837,6 +1804,7 @@
           }
           if (!r.ok) { throw new Error("Health check failed (" + r.status + ")"); }
           const health = await r.json();
+          if (__hSeq !== window.__healthSeq) return;
           if (health.ollamaReachable === false) {
             if (!isStreaming) {
               setStatus("offline");
@@ -1852,8 +1820,10 @@
           const __reqId = (window.__modelsReqId = (window.__modelsReqId || 0) + 1);
           loadModels(__reqId);
         } catch {
-          setStatus("offline");
-          document.getElementById("model-badge").textContent = "offline";
+          if (!isStreaming) { // never clobber the live streaming state with a failed poll
+            setStatus("offline");
+            document.getElementById("model-badge").textContent = "offline";
+          }
         }
       }
 
@@ -2305,14 +2275,10 @@
           '<button class="conv-action-btn" data-act="rename" title="Rename">' +
           '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
           "</button>" +
-          '<button class="conv-action-btn" onclick="exportConvById(event,\'' +
-          c.id +
-          '\')" title="Export">' +
+          '<button class="conv-action-btn" data-act="export" title="Export">' +
           '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
           "</button>" +
-          '<button class="conv-action-btn danger" onclick="deleteConv(event,\'' +
-          c.id +
-          '\')" title="Delete">' +
+          '<button class="conv-action-btn danger" data-act="delete" title="Delete">' +
           '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>' +
           "</button>" +
           "</div>";
@@ -2320,7 +2286,9 @@
         div.querySelector('[data-act="export"]')?.addEventListener('click', e => { e.stopPropagation(); exportConvById(e, c.id); });
         div.querySelector('[data-act="delete"]')?.addEventListener('click', e => { e.stopPropagation(); deleteConv(e, c.id); });
         div.addEventListener("click", (e) => {
-          if (!e.target.closest(".conv-actions")) loadConversation(c.id);
+          if (e.target.closest(".conv-actions")) return;
+          if (isStreaming) { showToast("A response is still running — stop it or wait before switching chats"); return; }
+          loadConversation(c.id);
         });
         return div;
       }
@@ -2341,7 +2309,7 @@
         input.focus();
         input.select();
         const done = async () => {
-          const newTitle = input.value.trim() || currentTitle;
+          const newTitle = input.value.replace(/[^\p{L}\p{N}\s,.?!-]/gu, "").trim().slice(0, 100) || currentTitle;
           await fetch("/api/conversations/" + id, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -2363,14 +2331,35 @@
         });
       }
 
+      let __tlP = null, __tlAgain = false;
+      function refreshTimeline(id) { // repaint approvals/tool trace from the DB; overlapping calls coalesce into one re-run instead of being dropped
+        if (__tlP) { __tlAgain = true; return __tlP; }
+        __tlP = (async () => {
+          try {
+            do {
+              __tlAgain = false;
+              const [c, ev] = await Promise.all([
+                fetch("/api/conversations/" + id).then((r) => r.json()),
+                fetch("/api/conversations/" + id + "/events").then((r) => r.json()).catch(() => []),
+              ]);
+              if (id === currentConvId) renderMessages(c.messages, ev);
+            } while (__tlAgain);
+          } catch {} finally { __tlP = null; }
+        })();
+        return __tlP;
+      }
+      let __loadSeq = 0;
       async function loadConversation(id) {
+        const seq = ++__loadSeq;
         try {
           const r = await fetch("/api/conversations/" + id);
           const data = await r.json();
           const rawEvents = await fetch("/api/conversations/" + id + "/events")
             .then((er) => er.json()).catch(() => []);
+          if (seq !== __loadSeq) return; // a newer load superseded this one
           currentConvId = id;
           currentModel = data.model || currentModel;
+          projectDetached = false;
           document.getElementById("model-badge").textContent = currentModel;
           const badge = document.getElementById("conv-project-badge");
           if (data.project_root) {
@@ -2389,6 +2378,7 @@
             document.getElementById('projectPanel').classList.remove('open');
             badge.style.display = "none";
           }
+          if (seq !== __loadSeq) return;
           updateActiveConv(id);
           document.getElementById("conv-title-display").textContent =
             data.title;
@@ -2397,8 +2387,27 @@
           window.__resumeIfActive = async function (id) {
             try {
               const resp = await fetch("/api/chat/stream/" + id);
-              if (!resp.ok) return; // 404 = nothing in flight, normal case
+              let resumeBuf = "";
+              const paintResume = () => {
+                if (id !== currentConvId || !resumeBuf) return;
+                let el = document.getElementById("resume-bubble");
+                if (!el) {
+                  el = document.createElement("div"); el.id = "resume-bubble"; el.className = "message-wrapper assistant";
+                  el.innerHTML = '<div class="msg-header"><div class="msg-avatar avatar-ai">✦</div><span>Assistant</span></div><div class="msg-bubble markdown-body streaming-cursor"></div>';
+                  document.getElementById("messages-inner").appendChild(el);
+                }
+                el.querySelector(".msg-bubble").innerHTML = renderMarkdown(resumeBuf);
+                scrollToBottomIfNearBottom();
+              };
+              if (!resp.ok) { // 404: the turn ended between the conversation fetch and this subscribe — its reply is in the DB, so repaint once
+                if (resp.status === 404 && id === currentConvId && !window.__resume404) {
+                  window.__resume404 = true; setTimeout(() => { window.__resume404 = false; }, 3000);
+                  await loadConversation(id);
+                }
+                return;
+              }
               setStreaming(true);
+              refreshTimeline(id).then(paintResume); // subscribe first, then repaint: closes the fetch-to-subscribe event gap
               const reader = resp.body.getReader();
               const decoder = new TextDecoder();
               let partial = "";
@@ -2412,6 +2421,11 @@
                   if (!line.startsWith("data: ")) continue;
                   try {
                     const evt = JSON.parse(line.slice(6));
+                    if (evt.snapshot !== undefined) resumeBuf = evt.snapshot;
+                    if (evt.token) resumeBuf += evt.token;
+                    if (evt.type === "stream_reset") { resumeBuf = ""; const rb = document.getElementById("resume-bubble"); if (rb) rb.remove(); }
+                    if (evt.snapshot !== undefined || evt.token) paintResume();
+                    if (["diff_pending", "command_pending", "diff_decided", "command_decided", "tool_end", "steer_note"].includes(evt.type)) refreshTimeline(id).then(paintResume); // re-render wipes the bubble, so repaint it
                     if (evt.done || evt.error) {
                       if (id === currentConvId) await loadConversation(id);
                       setStreaming(false);
@@ -2437,6 +2451,21 @@
           .forEach((el) => el.classList.toggle("active", el.dataset.id === id));
       }
 
+      // created_at has 1s resolution: a fast turn's tool trace and its reply share a timestamp and the
+      // stable sort put the trace AFTER the reply. Put same-second events before the last reply of that second.
+      function settleTimelineTies(tl) {
+        for (let i = 0; i < tl.length; ) {
+          let j = i + 1;
+          while (j < tl.length && tl[j].at === tl[i].at) j++;
+          const run = tl.slice(i, j);
+          const ms = run.filter((x) => x.kind === "message");
+          const evs = run.filter((x) => x.kind === "event");
+          let k = -1;
+          ms.forEach((x, n) => { if (x.m.role === "assistant") k = n; });
+          if (evs.length && k >= 0) tl.splice(i, run.length, ...ms.slice(0, k), ...evs, ...ms.slice(k));
+          i = j;
+        }
+      }
       function renderMessages(messages, rawEvents) {
         const inner = document.getElementById("messages-inner");
         inner.innerHTML = "";
@@ -2464,6 +2493,7 @@
             .filter(e => e.payload.type !== "diff_decided" && e.payload.type !== "command_decided")
             .map((e) => ({ at: e.at, kind: "event", payload: e.payload })),
         ].sort((a, b) => a.at - b.at);
+        settleTimelineTies(timeline);
         timeline.forEach((item) => {
           if (item.kind === "message") {
             if (item.m.role === "steer") { renderSteerNote(inner, item.m.content); return; }
@@ -2483,6 +2513,7 @@
       }
 
       async function startNewChat() {
+        if (isStreaming) { showToast("A response is still running — stop it or wait before starting a new chat"); return; }
         currentConvId = null;
         // A brand-new conversation must start fully unlinked from any project —
         // otherwise it would silently use whatever folder a previous conversation
@@ -2511,10 +2542,11 @@
           "Delete conversation",
           "This conversation will be permanently deleted and cannot be recovered.",
           async () => {
-            await fetch("/api/conversations/" + id, { method: "DELETE" });
+            let dr;
+            try { dr = await fetch("/api/conversations/" + id, { method: "DELETE" }); } catch { showToast("Delete failed — server unreachable"); return; }
+            if (!dr.ok) { const er = await dr.json().catch(() => ({})); showToast(er.error || "Delete failed", 4000); return; }
             if (currentConvId === id) startNewChat();
             await loadConversations();
-            window.__resumeIfActive?.(currentConvId);
             showToast("Conversation deleted");
           },
         );
@@ -2548,13 +2580,19 @@
         ]);
       }
 
-      function triggerDownload(url) {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+      async function triggerDownload(url) {
+        try {
+          const r = await fetch(url); // patched fetch adds x-app-token; a bare <a href> cannot
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const m = /filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "");
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(await r.blob());
+          a.download = m ? m[1] : "conversation";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        } catch (e) { showToast("Export failed: " + e.message, 4000); }
       }
 
       // ── Messages rendering ────────────────────────────────────────────────────────
@@ -2774,7 +2812,7 @@
               body: JSON.stringify({ pendingId: data.pendingId, approve })
             });
             ok = r.ok;
-          } catch {}
+          } catch { approveBtn.disabled = false; rejectBtn.disabled = false; showToast("Network error — decision not sent, try again", 4000); return; }
           if (!ok) {
             card.classList.add("diff-decided-reject");
             actions.innerHTML = "⚠ Expired — no longer pending, nothing was applied";
@@ -2830,7 +2868,7 @@
               body: JSON.stringify({ pendingId: data.pendingId, approve })
             });
             ok = r.ok;
-          } catch {}
+          } catch { approveBtn.disabled = false; rejectBtn.disabled = false; showToast("Network error — decision not sent, try again", 4000); return; }
           if (!ok) {
             card.classList.add("diff-decided-reject");
             actions.innerHTML = "⚠ Expired — no longer pending, command did not run";
@@ -2867,8 +2905,10 @@
         const wrapper = btn.closest(".message-wrapper");
         const bubble = wrapper.querySelector(".msg-bubble");
         const clone = bubble.cloneNode(true);
+    if (clone.querySelector(".msg-attachments")) { showToast("Not available for messages with attachments (the file context would be lost) — re-attach the file and send again", 5000); return; }
         clone.querySelectorAll(".msg-attachments").forEach((el) => el.remove());
-        const currentText = clone.innerText.trim();
+        const brs = Array.from(clone.querySelectorAll("br")); const brHasNl = brs.map((b) => { const pv = b.previousSibling; return !!(pv && pv.nodeType === 3 && /[\r\n]$/.test(pv.data)); }); brs.forEach((b, i) => b.replaceWith(brHasNl[i] ? "" : "\n")); // <br> alone does not survive on a detached node
+const currentText = clone.textContent.replace(/\r\n?/g, "\n").trim();
         const actions = wrapper.querySelector(".msg-actions");
 
         const ta = document.createElement("textarea");
@@ -2965,11 +3005,21 @@
         while (userIdx >= 0 && !allWrappers[userIdx].classList.contains("user")) userIdx--;
         if (userIdx < 0) return;
         const lastUser = allWrappers[userIdx];
-        const lastMsgId = lastUser.dataset.msgId;
-        const lastContent = lastUser
-          .querySelector(".msg-bubble")
-          .innerText.trim();
+    if (lastUser.querySelector(".msg-attachments")) { showToast("Not available for messages with attachments (the file context would be lost) — re-attach the file and send again", 5000); return; }
+        let lastMsgId = lastUser.dataset.msgId;
+        const bubbleClone = lastUser.querySelector(".msg-bubble").cloneNode(true);
+        bubbleClone.querySelectorAll(".msg-attachments").forEach((n) => n.remove());
+        const brs = Array.from(bubbleClone.querySelectorAll("br")); const brHasNl = brs.map((b) => { const pv = b.previousSibling; return !!(pv && pv.nodeType === 3 && /[\r\n]$/.test(pv.data)); }); brs.forEach((b, i) => b.replaceWith(brHasNl[i] ? "" : "\n")); // <br> alone does not survive on a detached node
+const lastContent = bubbleClone.textContent.replace(/\r\n?/g, "\n").trim();
 
+        if (!lastMsgId) { // live-sent user bubbles never get a DB id; DELETE .../undefined silently no-ops and duplicates the turn
+          try {
+            const conv = await fetch("/api/conversations/" + currentConvId).then((r) => r.json());
+            const at = conv.messages.findIndex((m) => m.id === msgId);
+            for (let k = at - 1; at >= 0 && k >= 0; k--) if (conv.messages[k].role === "user") { lastMsgId = conv.messages[k].id; break; }
+          } catch {}
+          if (!lastMsgId) { showToast("Could not regenerate — reopen the conversation and try again"); return; }
+        }
         // Delete the user turn being resent AND everything after it (including
         // the assistant reply) so we don't leave a duplicate user message behind.
         const delRes = await fetch(
@@ -2989,6 +3039,7 @@
 
       let projectRoot = null;
       let projectFileCount = 0;
+      let projectDetached = false;
 
       // Populates the sidebar tree + button state for a given folder path. Used both
       // when the user manually opens a folder and when a loaded conversation restores
@@ -3018,12 +3069,14 @@
             return false;
           }
           projectRoot = data.path;
+          projectDetached = false;
           projectFileCount = countFiles(data.tree);
           const tree = document.getElementById('projectTree');
           tree.innerHTML = '';
           renderTree(data.tree, tree);
           const countEl = document.getElementById('projectFileCount');
-          countEl.innerHTML = '';
+          document.querySelectorAll('#reindex-btn').forEach(b => b.remove());
+countEl.innerHTML = '';
           countEl.textContent = projectFileCount + ' files • ' + folderPath;
           countEl.insertAdjacentHTML('afterend',
             '<button id="reindex-btn" title="Re-index for semantic search" style="margin-left:8px;background:none;border:none;color:var(--text-dim);cursor:pointer;">🔄</button>');
@@ -3047,6 +3100,7 @@
 
       document.getElementById('project-btn').onclick = async (e) => {
         if (e.target.id === 'project-btn-clear') {
+          projectDetached = true;
           projectRoot = null;
           document.getElementById('project-btn').classList.remove('active');
           document.getElementById('project-btn-label').textContent = '📁 Open Project Folder';
@@ -3202,11 +3256,13 @@
         inner.appendChild(userWrapper);
         scrollToBottom();
 
+        const retrySend = () => { userWrapper.remove(); sendMessage(text); }; // server reuses the stored message; drop the stale bubble so Retry doesn't show it twice
         const formData = new FormData();
         formData.append("conversationId", currentConvId);
         formData.append("message", text);
         formData.append("model", currentModel);
         formData.append('projectRoot', projectRoot || '');
+        if (!projectRoot && projectDetached) formData.append('detachProject', '1');
         pendingFiles.forEach((item) =>
           formData.append("files", item.file, item.file.name),
         );
@@ -3245,7 +3301,7 @@
         abortController = new AbortController();
         let lastEventAt = Date.now();
         const stallTimer = setInterval(() => {
-          if (Date.now() - lastEventAt > 15000) {
+          if (Date.now() - lastEventAt > 15000 && !inner.querySelector(".diff-card:not(.diff-decided-approve):not(.diff-decided-reject)")) {
             statusWrap.querySelector(".status-text").textContent = "⚠ No update for 15s — may be stuck";
           }
         }, 5000);
@@ -3260,7 +3316,7 @@
             let msg = "Request failed (" + response.status + ")";
             try { msg = (await response.json()).error || msg; } catch {}
             if (typingEl.parentNode) typingEl.remove();
-            appendErrorMessage(msg, () => sendMessage(overrideText));
+            appendErrorMessage(msg, retrySend);
             clearInterval(stallTimer);
             clearInterval(statusTimerInt);
             if (statusWrap.parentNode) statusWrap.remove();
@@ -3287,7 +3343,7 @@
                 if (data.error) {
                   if (typingEl.parentNode) typingEl.remove();
                   if (streamBubble) streamBubble.classList.remove("streaming-cursor");
-                  appendErrorMessage(data.error, () => sendMessage(overrideText));
+                  appendErrorMessage(data.error, retrySend);
                   clearInterval(stallTimer);
                   clearInterval(statusTimerInt);
                   if (statusWrap.parentNode) statusWrap.remove();
@@ -3404,6 +3460,60 @@
               } catch (_) {}
             }
           }
+          if (!receivedDone && projectRoot) {
+            // Project turns intentionally survive the POST connection dropping (server.js
+            // res.on('close')) — the turn keeps running server-side. Reconnect via the
+            // resume stream instead of declaring it dead, so state stays in sync.
+            try {
+              const resumeResp = await fetch("/api/chat/stream/" + currentConvId);
+              if (resumeResp.ok) {
+                const rReader = resumeResp.body.getReader();
+                const rDecoder = new TextDecoder();
+                let rPartial = "";
+                let rDone = false;
+                while (true) {
+                  const { done: rEnded, value: rValue } = await rReader.read();
+                  if (rEnded) break;
+                  rPartial += rDecoder.decode(rValue, { stream: true });
+                  const rLines = rPartial.split("\n");
+                  rPartial = rLines.pop();
+                  for (const rLine of rLines) {
+                    if (!rLine.startsWith("data: ")) continue;
+                    try {
+                      const rEvt = JSON.parse(rLine.slice(6));
+                      if (["diff_pending", "command_pending", "diff_decided", "command_decided", "tool_end", "steer_note"].includes(rEvt.type)) refreshTimeline(currentConvId);
+                      if (rEvt.done || rEvt.error) { rDone = true; }
+                    } catch {}
+                  }
+                }
+                clearInterval(stallTimer);
+                clearInterval(statusTimerInt);
+                if (statusWrap.parentNode) statusWrap.remove();
+                if (statusDetail.parentNode) statusDetail.remove();
+                if (typingEl.parentNode) typingEl.remove();
+                setStreaming(false);
+                await loadConversation(currentConvId); // repaints from DB, including anything the resumed stream just finished
+                checkHealth();
+                return;
+              }
+            } catch {}
+            try { // 404: the turn may have finished between the drop and this reconnect — trust the DB, not a guess
+              const cv = await fetch("/api/conversations/" + currentConvId).then((r) => r.json());
+              const lastM = cv.messages && cv.messages[cv.messages.length - 1];
+              if (lastM && lastM.role === "assistant") {
+                clearInterval(stallTimer);
+                clearInterval(statusTimerInt);
+                if (statusWrap.parentNode) statusWrap.remove();
+                if (statusDetail.parentNode) statusDetail.remove();
+                if (typingEl.parentNode) typingEl.remove();
+                setStreaming(false);
+                await loadConversation(currentConvId);
+                checkHealth();
+                return;
+              }
+            } catch {}
+            // No reply in the DB either: turn is genuinely gone server-side too.
+          }
           if (!receivedDone) {
             clearInterval(stallTimer);
             clearInterval(statusTimerInt);
@@ -3411,7 +3521,7 @@
             if (statusDetail.parentNode) statusDetail.remove();
             if (typingEl.parentNode) typingEl.remove();
             if (streamBubble) streamBubble.classList.remove("streaming-cursor");
-            appendErrorMessage("Connection closed before the response finished.", () => sendMessage(overrideText));
+            appendErrorMessage("Connection closed before the response finished.", retrySend);
             setStreaming(false);
             checkHealth();
           }
@@ -3438,6 +3548,18 @@
             }
           } else {
             if (typingEl.parentNode) typingEl.remove();
+            const cid = currentConvId;
+            if (projectRoot && cid) { // project turns keep running server-side: re-attach instead of reporting failure
+              setStreaming(false);
+              showToast("Connection lost — reconnecting…", 3000);
+              for (let a = 0; a < 6; a++) {
+                await new Promise((r) => setTimeout(r, 1500 * (a + 1)));
+                try { const h = await fetch("/api/health"); if (h.ok) break; } catch {}
+              }
+              if (cid === currentConvId) await loadConversation(cid);
+              checkHealth();
+              return;
+            }
             appendErrorMessage("Connection error: " + err.message);
           }
           setStreaming(false);
@@ -3446,6 +3568,12 @@
       }
 
       function stopGeneration() {
+        if (currentConvId) { // project turns ignore the socket closing — always ask the server to cancel (404 is harmless)
+          fetch("/api/chat/stop", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ conversationId: currentConvId }),
+          }).catch(() => {});
+        }
         if (abortController) {
           abortController.abort();
           abortController = null;
@@ -3618,7 +3746,7 @@
 
       // ── Helpers ───────────────────────────────────────────────────────────────────
       function handleKeyDown(e) {
-        if (e.key === "Enter" && !e.shiftKey) {
+        if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
           e.preventDefault();
           sendMessage();
         }

@@ -3,12 +3,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${PORT:-3000}"
-export OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
+export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-gpt-oss:120b-cloud}"
 
 if [ ! -f .app_token ]; then
   command -v openssl >/dev/null 2>&1 || { echo "[ERROR] openssl not found. Install it, or manually create .app_token with a random 32-char hex string."; exit 1; }
-  openssl rand -hex 16 > .app_token
+  (umask 077; openssl rand -hex 16 > .app_token)
 fi
 export APP_TOKEN="$(cat .app_token)"
 

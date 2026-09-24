@@ -16,11 +16,12 @@ set OLLAMA_MODEL=gpt-oss:120b-cloud
 :: ─────────────────────────────────────────────────────────────────────────────
 
 set PORT=3000
-set OLLAMA_HOST=http://localhost:11434
+set OLLAMA_HOST=http://127.0.0.1:11434
 
 :: Auth token shared between server and browser UI (required — server refuses to start without it)
 if not exist "%~dp0.app_token" (
-    powershell -NoProfile -Command "[IO.File]::WriteAllText('%~dp0.app_token', [guid]::NewGuid().ToString('N'))"
+    set "TOKEN_FILE=%~dp0.app_token"
+    powershell -NoProfile -Command "[IO.File]::WriteAllText($env:TOKEN_FILE, [guid]::NewGuid().ToString('N'))"
 )
 set /p APP_TOKEN=<"%~dp0.app_token"
 echo App token: %APP_TOKEN%

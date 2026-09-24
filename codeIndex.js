@@ -13,7 +13,10 @@ const ALLOWED_EXT = new Set([
   '.md', '.txt', '.sh', '.bat', '.sql', '.gradle', '.properties', '.env'
 ]);
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'db', 'music', 'output', 'gradle', '.gradle']);
-const SENSITIVE_FILE_RX = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json|\.app_token|.*\.db)$/i;
+const SENSITIVE_FILE_RX_BASE = /(^|[\\\/])([\w.-]*\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)\w*|.*\.pfx|.*\.p12|credentials(\.json)?|.*secrets.*\.(json|ya?ml)|\.npmrc|\.netrc|.*\.keystore|config$|\.git[\\\/]config|\.aws[\\\/].*|\.kube[\\\/].*|\.ssh[\\\/].*|.*token.*\.(json|txt)|.*service[-_]?account.*\.json|\.app_token|.*\.db)$/i;
+
+// NTFS: "x::$DATA", "x." and "x " open "x" - test the canonical form too (callers only use .test()).
+const SENSITIVE_FILE_RX = { test: (s) => { s = String(s); return SENSITIVE_FILE_RX_BASE.test(s) || SENSITIVE_FILE_RX_BASE.test(s.replace(/:[^\\/]*$/, '').replace(/[. ]+$/, '')); } };
 
 function normRoot(root) {
   let r = path.resolve(root);
@@ -45,6 +48,7 @@ function listFiles(dir, base = dir, out = [], seen = new Set()) {
   for (const e of entries) {
     if (e.name.startsWith('.') || IGNORE_DIRS.has(e.name)) continue;
     const full = path.join(dir, e.name);
+    if (e.isSymbolicLink()) continue; // never follow symlinks — target may be outside the project root
     if (e.isDirectory()) { listFiles(full, base, out, seen); continue; }
     const ext = path.extname(e.name).toLowerCase();
     if (!ALLOWED_EXT.has(ext)) continue;
@@ -80,9 +84,14 @@ function embed(text) {
     }, res => {
       let data = '';
       res.on('data', c => data += c);
+      res.on('close', () => { if (!res.complete) reject(new Error('Embedding connection closed mid-response')); });
       res.on('end', () => {
         if (res.statusCode !== 200) return reject(new Error('Embedding request failed: ' + res.statusCode));
-        try { resolve(JSON.parse(data).embedding); } catch (e) { reject(e); }
+        try {
+          const v = JSON.parse(data).embedding;
+          if (!Array.isArray(v) || !v.length) throw new Error('Embedding response missing vector — is "' + EMBED_MODEL + '" pulled?');
+          resolve(v);
+        } catch (e) { reject(e); }
       });
     });
     req.on('timeout', () => { req.destroy(); reject(new Error('Embedding request timed out')); });
@@ -109,7 +118,7 @@ async function buildIndex(root) {
     let prevByPath = new Map();
     try {
       const prev = JSON.parse(fs.readFileSync(indexPathFor(root), 'utf8'));
-      for (const e of (prev.entries || [])) {
+      for (const e of (prev.partial ? [] : (prev.entries || []))) { // partial index: some files have missing chunks, never reuse
         if (!prevByPath.has(e.path)) prevByPath.set(e.path, []);
         prevByPath.get(e.path).push(e);
       }
@@ -132,7 +141,7 @@ async function buildIndex(root) {
     buildStatus.set(key, { status: 'running', total: totalChunks, done: 0 });
 
     let done = 0;
-    let sinceCheckpoint = 0; // counts embeds since the last on-disk checkpoint — avoids the % modulo racing across concurrent workers
+    let failed = 0, sinceCheckpoint = 0; // counts embeds since the last on-disk checkpoint — avoids the % modulo racing across concurrent workers
     const jobs = []; // flat list of { f, c, hash } for every chunk that needs embedding
     for (const { f, chunks, hash } of perFileChunks) {
       const cached = hash && prevByPath.get(f);
@@ -158,9 +167,9 @@ async function buildIndex(root) {
         try {
           const vector = await embed(c.text);
           entries.push({ path: f, startLine: c.startLine, endLine: c.endLine, text: c.text, vector, fileHash: hash });
-        } catch (e) { console.warn('[codeIndex] embed failed for', f, e.message); }
+        } catch (e) { failed++; console.warn('[codeIndex] embed failed for', f, e.message); }
         done++;
-        sinceCheckpoint++;
+        if (!failed) sinceCheckpoint++; // never checkpoint over a good index while embeds are failing
         buildStatus.set(key, { status: 'running', total: totalChunks, done });
         if (sinceCheckpoint >= 200) {
           sinceCheckpoint -= 200;
@@ -175,8 +184,9 @@ async function buildIndex(root) {
     }
     await Promise.all(Array.from({ length: Math.min(EMBED_CONCURRENCY, jobs.length) }, worker));
     await checkpointing; // make sure the last in-flight checkpoint write finished before the final write below
-    atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries });
-    buildStatus.set(key, { status: 'done', total: totalChunks, done: totalChunks });
+    if (jobs.length && failed === jobs.length && !entries.length) throw new Error('Embedding failed for every chunk — is "' + EMBED_MODEL + '" pulled and Ollama running?');
+    atomicWriteJSON(indexPathFor(root), { builtAt: Date.now(), fileCount: files.length, entries, ...(failed ? { partial: true } : {}) });
+    buildStatus.set(key, { status: failed ? 'incomplete' : 'done', total: totalChunks, done: totalChunks - failed });
   } catch (e) {
     buildStatus.set(key, { status: 'error', error: e.message, total: 0, done: 0 });
   }

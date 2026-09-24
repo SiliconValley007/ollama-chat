@@ -5,7 +5,7 @@ const { APP_ROOT } = require('./paths');
 
 const DB_DIR = path.join(APP_ROOT, 'db');
 if (!fs.existsSync(DB_DIR)) {
-  fs.mkdirSync(DB_DIR, { recursive: true });
+  // created lazily in getDb() so failures surface through init().catch() with a readable message
 }
 const DB_PATH = path.join(DB_DIR, 'chats.db');
 
@@ -16,6 +16,7 @@ async function getDb() {
   if (_db) return _db;
   if (_ready) return _ready;
   _ready = (async () => {
+    fs.mkdirSync(DB_DIR, { recursive: true });
     const SQL = await initSqlJs({
       locateFile: file => path.join(path.dirname(require.resolve('sql.js/dist/sql-wasm.js')), file)
     });
@@ -44,6 +45,8 @@ async function getDb() {
     `);
     try { _db.run('ALTER TABLE conversations ADD COLUMN project_root TEXT DEFAULT NULL;'); }
     catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
+    try { _db.run('ALTER TABLE messages ADD COLUMN context TEXT DEFAULT NULL;'); }
+    catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
     _db.run(`CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, type TEXT NOT NULL,
       payload TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
@@ -54,21 +57,45 @@ async function getDb() {
   return _ready;
 }
 
-function atomicWrite(data) {
-  const tmp = DB_PATH + '.tmp';
+let writeSeq = 0, syncGen = 0; // syncGen: bumped by every flushSync so an older in-flight async snapshot is discarded, never renamed over it
+function atomicWriteSync(data) {
+  const tmp = DB_PATH + '.' + process.pid + '.' + (++writeSeq) + '.tmp'; // unique per write: sync and async writers never share a tmp file
   fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, DB_PATH); // rename is atomic — DB_PATH is never left half-written
+  for (let i = 0; ; i++) { // Windows: AV/indexer can briefly hold DB_PATH -> EPERM/EBUSY on rename
+    try { fs.renameSync(tmp, DB_PATH); return; } // atomic — DB_PATH is never left half-written
+    catch (e) { if (i >= 5 || !/^(EPERM|EBUSY|EACCES)$/.test(e.code)) throw e; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (i + 1)); }
+  }
+}
+// Non-blocking variant for the periodic background save — atomicWriteSync's
+// Atomics.wait stalls the whole event loop (all active SSE streams included),
+// which is only acceptable at true exit-time (flushSync), not on every debounced write.
+function atomicWriteAsync(data, gen, cb) {
+  const tmp = DB_PATH + '.' + process.pid + '.' + (++writeSeq) + '.tmp';
+  fs.writeFile(tmp, data, (werr) => {
+    if (werr) return cb(werr);
+    const attempt = (i) => {
+      if (gen !== syncGen) return fs.unlink(tmp, () => cb(null)); // a flushSync already persisted newer data
+      fs.rename(tmp, DB_PATH, (e) => {
+        if (!e) return cb(null);
+        if (i >= 5 || !/^(EPERM|EBUSY|EACCES)$/.test(e.code)) return cb(e);
+        setTimeout(() => attempt(i + 1), 50 * (i + 1));
+      });
+    };
+    attempt(0);
+  });
 }
 let saveTimer = null;
 function save() {
   if (!_db) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => atomicWrite(Buffer.from(_db.export())), 300);
+  saveTimer = setTimeout(() => { const gen = syncGen; atomicWriteAsync(Buffer.from(_db.export()), gen, (e) => { if (e) { console.error('[db] save failed, retrying:', e.message); save(); } }); }, 300);
 }
 function flushSync() {
   if (!_db) return;
   clearTimeout(saveTimer);
-  atomicWrite(Buffer.from(_db.export()));
+  syncGen++;
+  try { atomicWriteSync(Buffer.from(_db.export())); }
+  catch (e) { console.error('[db] flush failed (kept in memory, will retry):', e.message); save(); } // must never throw out of finish()/shutdown
 }
 
 function run(sql, params = []) { _db.run(sql, params); save(); }
@@ -115,14 +142,14 @@ module.exports = {
   },
 
   searchConversations(query) {
-    const q = '%' + query + '%';
+    const q = '%' + String(query).replace(/[\\%_]/g, '\\$&') + '%';
     return all(`
       SELECT DISTINCT c.id, c.title, c.model, c.created_at, c.updated_at,
         (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
         (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) as message_count
       FROM conversations c
       LEFT JOIN messages m ON m.conversation_id = c.id
-      WHERE c.title LIKE ? OR m.content LIKE ?
+      WHERE c.title LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\'
       ORDER BY c.updated_at DESC LIMIT 50
     `, [q, q]);
   },
@@ -145,6 +172,8 @@ module.exports = {
     run('DELETE FROM conversations WHERE id = ?', [id]);
   },
 
+  setMessageContext(id, context) { run('UPDATE messages SET context = ? WHERE id = ?', [context, id]); },
+
   addMessage(id, conversationId, role, content, editedFiles = null) {
     if(editedFiles) {
       run('INSERT INTO messages (id, conversation_id, role, content, edited_files) VALUES (?, ?, ?, ?, ?)', [id, conversationId, role, content, JSON.stringify(editedFiles)]);
@@ -155,7 +184,7 @@ module.exports = {
   },
 
   getMessages(conversationId) {
-    return all('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC', [conversationId]);
+    return all('SELECT id, conversation_id, role, content, created_at, edited_files FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC', [conversationId]);
   },
 
   addEvent(id, conversationId, type, payload) {
@@ -165,13 +194,14 @@ module.exports = {
     return all('SELECT * FROM events WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC', [conversationId]);
   },
   getMessageHistory(conversationId) {
-    return all("SELECT role, content FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC, rowid ASC", [conversationId]);
+    return all("SELECT role, content, context FROM messages WHERE conversation_id = ? AND role != 'steer' ORDER BY created_at ASC, rowid ASC", [conversationId])
+      .map(r => ({ role: r.role, content: r.context ? r.context + '\n' + r.content : r.content }));
   },
 
   // Delete a specific message and all messages after it (for edit/regenerate)
   deleteMessagesFrom(conversationId, messageId) {
     const msg = get('SELECT rowid, created_at FROM messages WHERE id = ? AND conversation_id = ?', [messageId, conversationId]);
-    if (!msg) return;
+    if (!msg) return false;
     // Use rowid-based cutoff (monotonic, unlike second-granularity created_at) so
     // sibling events inserted in the same second as the truncated message aren't
     // ambiguously kept or dropped. events.rowid is not directly comparable to
@@ -179,5 +209,6 @@ module.exports = {
     run('DELETE FROM messages WHERE conversation_id = ? AND rowid >= ?', [conversationId, msg.rowid]);
     run('DELETE FROM events WHERE conversation_id = ? AND created_at >= ?', [conversationId, Math.max(0, msg.created_at - 1)]);
     save();
+    return true;
   }
 };

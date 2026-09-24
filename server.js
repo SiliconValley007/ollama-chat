@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { diffLines } = require('diff');
 const db = require('./db');
 const { CLOUD_MODEL_CHAIN, isRetryableError } = require('./modelRouter');
@@ -21,11 +21,28 @@ const log = {
   error: (...a) => console.error(log._fmt('ERROR', a)),
 };
 process.on('unhandledRejection', (e) => { log.error('[unhandledRejection]', e && e.message || String(e)); try { require('./db').flushSync(); } catch {} });
-process.on('uncaughtException', (e) => { log.error('[uncaughtException]', e && e.message || String(e)); try { require('./db').flushSync(); } catch {} process.exit(1); });
+process.on('uncaughtException', (e) => {
+  log.error('[uncaughtException]', e && e.stack || String(e));
+  try { require('./db').flushSync(); } catch {}
+  try { if (global.__srv) global.__srv.close(); } catch {} // stop accepting requests in an undefined state
+  console.error('\n[FATAL] Unexpected error - the server has stopped. Your chats are saved. Details are printed above.');
+  waitForKeyThenExit(1); // pkg: keeps the console open until a key is pressed; source: exits immediately
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
+const OLLAMA_HOST = (() => {
+  let h = (process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').trim();
+  if (!/^https?:\/\//i.test(h)) h = 'http://' + h;
+  try {
+    const u = new URL(h);
+    if (!u.port && u.protocol === 'http:') u.port = '11434';
+    if (u.hostname === '0.0.0.0' || u.hostname === 'localhost') u.hostname = '127.0.0.1';
+    h = u.origin;
+  } catch { h = 'http://127.0.0.1:11434'; }
+  process.env.OLLAMA_HOST = h; // codeIndex.js reads this lazily
+  return h;
+})();
 const DEFAULT_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:120b-cloud';
 
 // ─── Runtime tuning (env-overridable, single source of truth) ────────────────
@@ -64,12 +81,12 @@ function loadOrCreateToken() {
   } catch (e) {
     log.error('Could not read/create .app_token in ' + APP_ROOT + ':', e.message);
     console.error('\n[FATAL] Cannot write to ' + APP_ROOT + '.');
-    console.error('  Move ollama-chat.exe to a folder you can write to (e.g. Desktop or Documents) and relaunch.\n');
+    console.error('  Move ' + (isPkg ? path.basename(process.execPath) : 'the app folder') + ' to a folder you can write to (e.g. Desktop or Documents) and relaunch.\n');
     return null;
   }
 }
 const SHARED_TOKEN = loadOrCreateToken();
-if (!SHARED_TOKEN) { log.error('No APP_TOKEN available — refusing to start without auth.'); process.exit(1); }
+if (!SHARED_TOKEN) { log.error('No APP_TOKEN available — refusing to start without auth.'); waitForKeyThenExit(1); }
 const PUBLIC_ASSETS = new Set(['/', '/index.html', '/sw.js', '/manifest.json', '/favicon.svg', '/icon-192.png', '/icon-192.svg', '/icon-512.png', '/icon-512.svg']);
 // NOTE: all /api/* routes remain behind the token check below — only the HTML shell is public now.
 app.use((req, res, next) => {
@@ -148,7 +165,7 @@ app.delete('/api/conversations/:id/messages-from/:msgId', (req, res) => {
     return res.status(409).json({ error: 'Cannot edit/regenerate while a message is in flight. Wait for it to finish or stop it first.' });
   }
   try {
-    db.deleteMessagesFrom(req.params.id, req.params.msgId);
+    if (!db.deleteMessagesFrom(req.params.id, req.params.msgId)) return res.status(404).json({ error: 'Message not found' });
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -159,7 +176,7 @@ app.get('/api/conversations/:id/export', (req, res) => {
   try {
     const conversation = db.getConversation(req.params.id);
     if (!conversation) return res.status(404).json({ error: 'Not found' });
-    const messages = db.getMessages(req.params.id);
+    const messages = db.getMessages(req.params.id).filter(m => m.role !== 'steer');
     const fmt = req.query.format || 'md';
 
     let content = '';
@@ -194,6 +211,7 @@ app.get('/api/chat/stream/:conversationId', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   res.on('error', () => {});
+  if (turn.getContent) { const c = turn.getContent(); if (c) res.write('data: ' + JSON.stringify({ snapshot: c }) + '\n\n'); } // text so far, sent before subscribing (no gap)
   turn.subscribers.add(res);
   res.on('close', () => turn.subscribers.delete(res));
 });
@@ -203,7 +221,7 @@ app.post('/api/chat/steer', (req, res) => {
   const turn = activeTurns.get(conversationId);
   if (!turn) return res.status(409).json({ error: 'No active turn for this conversation' });
   if (!turn.emit) return res.status(409).json({ error: 'Steering is only supported for project (agentic) turns.' });
-  const note = (req.body.note || '').trim();
+  const note = typeof req.body.note === 'string' ? req.body.note.trim() : '';
   if (!note) return res.json({ ok: true });
   turn.queue.push(note);
   const noteId = uuidv4();
@@ -228,6 +246,22 @@ app.post('/api/chat/command-approve', (req, res) => {
   pendingCommands.delete(pendingId);
   try { pending.onDecision(!!approve); res.json({ ok: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Explicit cancel for project (agentic) turns — needed because their SSE connection
+// closing no longer implies abort (see res.on('close') in /api/chat).
+app.post('/api/chat/stop', (req, res) => {
+  for (const map of [pendingDiffs, pendingCommands]) {
+    for (const [pid, pnd] of [...map]) {
+      if (pnd.conversationId === req.body.conversationId) { map.delete(pid); try { pnd.onDecision(false); } catch {} }
+    }
+  }
+  const turn = activeTurns.get(req.body.conversationId);
+  if (!turn) return res.status(404).json({ error: 'No active turn for this conversation' });
+  turn.aborted = true;
+  turn.activeRequest?.destroy();
+  killProcessTree(turn.activeChild);
+  res.json({ ok: true });
 });
 
 app.post('/api/chat', upload.array('files', 10), async (req, res) => {
@@ -261,7 +295,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
 
   for (const file of files) {
     const mime = file.mimetype;
-    const name = file.originalname;
+    const name = /^[\x00-\xff]*$/.test(file.originalname) ? Buffer.from(file.originalname, 'latin1').toString('utf8') : file.originalname; // multer decodes as latin1
     try {
       if (mime.startsWith('image/')) {
         content_parts.push({ type: 'text', text: '[Image rejected: ' + name + ' — no available model supports image understanding]' });
@@ -271,7 +305,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
         const buffer = fs.readFileSync(file.path);
         let pdfText = '';
         try {
-          const parsed = await pdfParse(buffer);
+          const parsed = await pdfParse(new Uint8Array(buffer)); // copy: pooled small Buffers have byteOffset != 0, which pdf.js ignores
           pdfText = (parsed.text || '').trim();
           log.info('[file] PDF:', name, pdfText.length, 'chars');
         } catch (e) { log.warn('[file] pdf-parse failed:', name, e.message); }
@@ -280,7 +314,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
           const truncated = pdfText.slice(0, 40000);
           const ellipsis = pdfText.length > 40000 ? '\n[...truncated]' : '';
           content_parts.push({ type: 'text', text: '<document filename="' + name + '" type="pdf">\n' + truncated + ellipsis + '\n</document>' });
-          storage_lines.push('[PDF attached: ' + name + ' — ' + Math.round(pdfText.length / 1000) + 'k chars extracted]');
+          storage_lines.push('[PDF attached: ' + name + ' — ' + (pdfText.length < 1000 ? pdfText.length + ' chars' : Math.round(pdfText.length / 1000) + 'k chars') + ' extracted]');
         } else {
           content_parts.push({ type: 'text', text: '<document filename="' + name + '">\n[Scanned/image-only PDF — no text extractable. Ask user to paste text or send screenshots.]\n</document>' });
           storage_lines.push('[PDF attached: ' + name + ' — scanned/image-only]');
@@ -302,14 +336,26 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
     }
   }
 
+  const attachmentContext = content_parts.map(p => p.text || '').join('\n').slice(0, 60000); // persisted so follow-up turns still see the files
   if (message) content_parts.push({ type: 'text', text: message });
 
   const storageContent = [...storage_lines, message].filter(Boolean).join('\n');
-  db.addMessage(uuidv4(), conversationId, 'user', storageContent);
+  let userMsgId = uuidv4();
+  const priorMsgs = db.getMessages(conversationId);
+  const priorLast = priorMsgs[priorMsgs.length - 1];
+  if (!attachmentContext && priorLast && priorLast.role === 'user' && priorLast.content === storageContent) {
+    userMsgId = priorLast.id; // Retry of a turn that produced no reply: reuse the stored message instead of duplicating it
+  } else {
+    db.addMessage(userMsgId, conversationId, 'user', storageContent);
+    if (attachmentContext) db.setMessageContext(userMsgId, attachmentContext);
+  }
 
   const rawHistory = db.getMessageHistory(conversationId);
 
-  const requestedProjectRoot = req.body.projectRoot && fs.existsSync(req.body.projectRoot) ? req.body.projectRoot : null;
+  const requestedProjectRoot = req.body.projectRoot && fs.existsSync(req.body.projectRoot) && fs.statSync(req.body.projectRoot).isDirectory() ? req.body.projectRoot : null;
+  if (req.body.detachProject === '1' && !requestedProjectRoot && conversation.project_root) { // user explicitly cleared the folder: stop silently re-attaching tools
+    db.updateConversationProjectRoot(conversationId, null); conversation.project_root = null;
+  }
   projectRoot = requestedProjectRoot || (conversation.project_root && fs.existsSync(conversation.project_root) ? conversation.project_root : null);
   if (requestedProjectRoot && requestedProjectRoot !== conversation.project_root) {
     db.updateConversationProjectRoot(conversationId, requestedProjectRoot);
@@ -328,7 +374,7 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
       'After making changes, briefly summarize what you edited.';
     if (fileCount > LARGE_REPO_THRESHOLD) {
       systemContent = 'You have access to the user\'s open project at "' + projectRoot + '" (' + fileCount + ' files — too large for a full tree dump). ' +
-        (indexStatus.status === 'done'
+        ((indexStatus.status === 'done' || indexStatus.status === 'incomplete')
           ? 'A semantic index exists — use search_codebase to find relevant code before reading files directly.'
           : 'No semantic index exists yet — the user should run indexing, or you can still use read_file with paths they mention.') +
         ' ' + baseInstructions;
@@ -384,23 +430,23 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   res.on('close', () => {
     if (finished) return; // normal completion already handled everything — a late/duplicate
                            // 'close' must never touch a NEW turn's pending diffs/commands.
+    const turn = activeTurns.get(conversationId);
+    // A project (agentic) turn is designed to survive this connection closing — the user
+    // can reconnect via GET /api/chat/stream/:id and still approve pending diffs/commands.
+    // Only detach this subscriber; do NOT abort, or reload silently kills in-flight tool
+    // calls and discards their results. Explicit cancellation goes through /api/chat/stop.
+    if (projectRoot) {
+      if (turn) turn.subscribers.delete(res);
+      return;
+    }
     userAborted = true;
     ollamaReq?.destroy();
-    const turn = activeTurns.get(conversationId);
     if (turn) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
-    // Deliberately NOT force-rejecting pendingDiffs/pendingCommands here: this handler
-    // fires on a page reload/tab close as well as an explicit Stop, and reload should let
-    // the user still approve/reject from the reopened chat (the pendingId survives
-    // independently of this connection). Genuine abandonment is still bounded by the
-    // existing 5-minute timeout in stageFileChange/stageCommandExecution.
-    // Save whatever partial reply had streamed in so far, and still set the
-    // conversation title — otherwise a stopped response vanishes on refresh
-    // and the chat stays named "New Chat" forever.
     finish();
   });
 
   function finish() {
-    if (finished) { activeTurns.delete(conversationId); return; }
+    if (finished) return;
     finished = true;
         if (assistantContent || lastEditedFiles) {
       db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent || 'Done.', lastEditedFiles);
@@ -418,8 +464,9 @@ app.post('/api/chat', upload.array('files', 10), async (req, res) => {
   }
 
 function sendError(msg) {
-  if ((assistantContent || lastEditedFiles) && !finished) {
-    finished = true;
+  if (sendError.done) return; sendError.done = true;
+  const wasFinished = finished; finished = true; // always mark done, so late close/end callbacks can't touch a new turn
+  if ((assistantContent || lastEditedFiles) && !wasFinished) {
     db.addMessage(assistantMsgId, conversationId, 'assistant', assistantContent, lastEditedFiles);
     if (conversation.title === 'New Chat') {
       db.updateConversationTitle(conversationId, generateTitle(message || storage_lines[0] || 'File upload'));
@@ -454,8 +501,9 @@ function sendError(msg) {
       };
       const turnRef = activeTurns.get(conversationId);
       if (turnRef) turnRef.emit = emit;
+      if (turnRef) turnRef.getContent = () => assistantContent;
       let result, usedModel = conversation.model || DEFAULT_MODEL;
-      const chain = [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)];
+      const chain = (/[-:]cloud$/i.test(usedModel) || process.env.ALLOW_CLOUD_FALLBACK_FROM_LOCAL === 'true') ? [usedModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== usedModel)] : [usedModel];
       let lastErr;
       // Fresh copy per attempt — resolveToolCalls mutates its `messages` arg in place,
       // so reusing one array across fallback attempts leaks a failed model's partial
@@ -464,7 +512,7 @@ function sendError(msg) {
       const sharedEditedFiles = new Set();
       for (const m of chain) {
         try { result = await resolveToolCalls(historyForOllama.slice(), projectRoot, m, conversationId, emit, sharedEditedFiles); usedModel = m; break; }
-        catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); }
+        catch (err) { lastErr = err; if (!isRetryableError(err)) throw err; log.warn('[fallback] ' + m + ' failed, trying next'); emit({ type: 'model_fallback', from: m }); emit({ type: 'stream_reset' }); }
       }
       if (!result) throw lastErr || new Error('All models exhausted');
       if (usedModel !== conversation.model) db.updateConversationModel(conversationId, usedModel);
@@ -474,13 +522,15 @@ function sendError(msg) {
       broadcast(JSON.stringify({ usage: { promptTokens: result.promptTokens, evalTokens: result.evalTokens } }));
       finish();
     } catch (err) {
-      sendError('Project chat error: ' + err.message);
+      const tAb = activeTurns.get(conversationId);
+      if (tAb && tAb.aborted) finish(); // user pressed Stop: normal end, not an error
+      else sendError('Project chat error: ' + err.message);
     }
     return;
   }
 
   const baseModel = conversation.model || DEFAULT_MODEL;
-  const modelChain = [baseModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== baseModel)];
+  const modelChain = (/[-:]cloud$/i.test(baseModel) || process.env.ALLOW_CLOUD_FALLBACK_FROM_LOCAL === 'true') ? [baseModel, ...CLOUD_MODEL_CHAIN.filter(m => m !== baseModel)] : [baseModel];
 
   function attemptStream(chainIdx) {
     if (chainIdx >= modelChain.length) {
@@ -508,10 +558,12 @@ function sendError(msg) {
       if (ollamaRes.statusCode !== 200) {
         let errBody = '';
         ollamaRes.on('data', c => errBody += c);
+        ollamaRes.on('close', () => { if (!ollamaRes.complete) ollamaRes.emit('end'); }); // body cut mid-response: 'end' never fires, turn would hang
         ollamaRes.on('end', () => {
-          const err = new Error('Ollama error ' + ollamaRes.statusCode + ': ' + errBody);
+          const err = new Error('Ollama error ' + ollamaRes.statusCode + ': ' + errBody); err.status = ollamaRes.statusCode;
           if (isRetryableError(err) && chainIdx < modelChain.length - 1) {
             log.warn('[fallback] ' + model + ' failed pre-stream (' + ollamaRes.statusCode + '), trying next model');
+            broadcast(JSON.stringify({ type: 'model_fallback', from: model }));
             attemptStream(chainIdx + 1);
           } else {
             sendError(err.message);
@@ -542,6 +594,7 @@ function sendError(msg) {
               assistantContent += data.message.content;
               broadcast(JSON.stringify({ token: data.message.content }));
             }
+            if (data.error) { if (!finished) sendError('Ollama error: ' + data.error); ollamaReq.destroy(); return; }
             if (data.done === true) {
               broadcast(JSON.stringify({ usage: { promptTokens: data.prompt_eval_count || 0, evalTokens: data.eval_count || 0 } }));
               finish();
@@ -549,20 +602,30 @@ function sendError(msg) {
           } catch (_) {}
         }
       });
-      ollamaRes.on('end', () => { if (!finished) finish(); });
-      ollamaRes.on('error', err => { if (!finished) sendError('Stream error: ' + err.message); });
+      ollamaRes.on('end', () => {
+        if (finished || superseded) return; // the data.done branch above already finished the turn; a superseded attempt must not either
+        let tail = null; try { tail = JSON.parse(lineBuffer.trim()); } catch {}
+        if (tail && tail.done === true) { broadcast(JSON.stringify({ usage: { promptTokens: tail.prompt_eval_count || 0, evalTokens: tail.eval_count || 0 } })); finish(); }
+        else sendError('Ollama closed the stream before the response was complete.');
+      });
+      ollamaRes.on('error', err => { if (!finished && !superseded) sendError('Stream error: ' + err.message); }); // a response abandoned by the timeout fallback must not kill the turn the next model is serving
     });
 
-    ollamaReq.on('timeout', () => {
+      let superseded = false;
+      ollamaReq.on('timeout', () => {
+      superseded = true;
       ollamaReq.destroy();
       if (!gotFirstByte && chainIdx < modelChain.length - 1) {
         log.warn('[fallback] ' + model + ' timed out pre-stream, trying next model');
+        broadcast(JSON.stringify({ type: 'model_fallback', from: model }));
         attemptStream(chainIdx + 1);
       } else if (!finished) sendError('Request timed out.');
     });
     ollamaReq.on('error', err => {
+    if (superseded) return;
       if (!gotFirstByte && isRetryableError(err) && chainIdx < modelChain.length - 1) {
         log.warn('[fallback] ' + model + ' unreachable (' + err.message + '), trying next model');
+        broadcast(JSON.stringify({ type: 'model_fallback', from: model }));
         attemptStream(chainIdx + 1);
       } else if (!finished) sendError('Cannot connect to Ollama: ' + err.message);
     });
@@ -625,6 +688,7 @@ app.get('/api/models', (req, res) => {
   const httpMod = urlObj.protocol === 'https:' ? require('https') : require('http');
   let data = '';
   const r = httpMod.get(OLLAMA_HOST + '/api/tags', { timeout: 5000 }, ollamaRes => {
+    ollamaRes.on('close', () => { if (!ollamaRes.complete && !res.headersSent) res.json([]); }); // mid-body socket drop never emits 'end'
     ollamaRes.on('data', c => data += c);
     ollamaRes.on('end', () => {
       try {
@@ -642,7 +706,7 @@ app.get('/api/models', (req, res) => {
 function loadProjectRules(root) {
   const candidates = ['Ollama.md', '.cursorrules', '.cursor/rules.md'];
   for (const rel of candidates) {
-    const p = path.join(root, rel);
+    let p; try { p = safeResolve(root, rel); } catch { continue; } // symlinked rules file must not leak outside the project
     if (fs.existsSync(p)) {
       try { return { file: rel, content: fs.readFileSync(p, 'utf8').slice(0, 6000) }; } catch {}
     }
@@ -670,8 +734,9 @@ function safeResolve(root, relPath) {
   // symlinked intermediate directory even when the final component (a new file
   // write_file is about to create) doesn't exist yet.
   let probe = p;
-  while (!fs.existsSync(probe)) probe = path.dirname(probe);
-  const realProbe = fs.realpathSync(probe);
+  for (;;) { try { fs.lstatSync(probe); break; } catch { const up = path.dirname(probe); if (up === probe) break; probe = up; } }
+  let realProbe;
+  try { realProbe = fs.realpathSync(probe); } catch { throw new Error('Path outside project root (dangling symlink)'); }
   if (realProbe !== realRoot && !realProbe.startsWith(realRoot + path.sep)) throw new Error('Path outside project root (symlink)');
   return p;
 }
@@ -680,11 +745,12 @@ const MAX_TOOL_CALLS = parseInt(process.env.MAX_TOOL_CALLS || '1000', 10);
 
 // Keeps the tool-result portion of the conversation under TOOL_LOOP_CHAR_BUDGET by
 // collapsing the oldest tool outputs first. Never touches system/user/assistant turns.
-function enforceToolBudget(messages, budgetChars) {
+function enforceToolBudget(messages, budgetChars, pinnedIdx = -1) {
   let total = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== 'tool' && m.role !== 'assistant' && !(m.role === 'user' && i > 0)) continue;
+    if (i === pinnedIdx) { total += (m.content || '').length; continue; } // the user's actual request is never collapsed
     total += (m.content || '').length;
     if (total > budgetChars) {
       if (m.role === 'tool' && !m.content.startsWith('[older tool output omitted')) {
@@ -700,6 +766,8 @@ const { SENSITIVE_FILE_RX } = require('./codeIndex');
 function toolReadFile(root, relPath) {
   if (SENSITIVE_FILE_RX.test(relPath)) return 'Error: reading this file is blocked (matches a secrets/key pattern) — this project sends file contents to a cloud-hosted model.';
   const resolved = safeResolve(root, relPath);
+  // A symlink inside the project can point at a secret file - re-check the REAL path.
+  try { if (SENSITIVE_FILE_RX.test(path.relative(fs.realpathSync(root), fs.realpathSync(resolved)))) return 'Error: reading this file is blocked (symlink to a secrets/key file).'; } catch {}
   const stat = fs.statSync(resolved);
   if (stat.size > 20 * 1024 * 1024) return 'Error: file is ' + Math.round(stat.size/1024/1024) + 'MB — too large to read directly. Use execute_command (head/sed/grep) to inspect it in pieces.';
   const full = fs.readFileSync(resolved, 'utf8');
@@ -717,33 +785,61 @@ const SHELL_BLOCKLIST = [
   /\b(rm|del|rmdir|remove-item|rd)\b[^\n]*\.\.(?:[\\/]|\s|$)/i
 ];
 
-function killProcessTree(child) {
-  if (!child || !child.pid || child.killed) return;
-  if (process.platform === 'win32') { try { execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {}).on('error', () => {}); } catch {} }
-  else { try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} } }
+function killProcessTree(child, force) {
+  if (!child || !child.pid) return;
+  if (process.platform === 'win32') { try { execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {}).on('error', () => {}); } catch {} return; }
+  const kill = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
+  kill(force ? 'SIGKILL' : 'SIGTERM');
+  // A command that traps/ignores SIGTERM would otherwise hang the turn (and lock the conversation) forever.
+  if (!force) setTimeout(() => kill('SIGKILL'), 3000).unref();
+}
+
+// execFile silently drops `detached`, so its child stayed in the server's process group and
+// process.kill(-pid) never reached grandchildren. spawn honours it; stdin is closed so prompts can't hang.
+function execDetached(file, args, opts, cb) {
+  const child = spawn(file, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+  const CAP = 64 * 1024;
+  let out = '', errOut = '', done = false;
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', d => { if (out.length < CAP) out += d; });
+  child.stderr.on('data', d => { if (errOut.length < CAP) errOut += d; });
+  const end = (err) => { if (done) return; done = true; cb(err, out, errOut); };
+  child.on('error', end);
+  child.on('close', (code, signal) => {
+    if (code === 0) return end(null);
+    const e = new Error('Command failed'); e.code = code; e.signal = signal; e.killed = !!signal;
+    end(e);
+  });
+  return child;
 }
 
 function runShellCommand(root, command, settle, conversationId) {
-  const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
-  const shellFlag = process.platform === 'win32' ? '/c' : '-c';
-  const child = execFile(shell, [shellFlag, command], { cwd: root, timeout: 60000, maxBuffer: 2 * 1024 * 1024, detached: process.platform !== 'win32' }, (err, stdout, stderr) => {
+  const isWin = process.platform === 'win32';
+  const shell = isWin ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
+  // cmd.exe does not understand the \" escaping execFile applies to argv - pass the line verbatim, exactly like child_process.exec does.
+  const shellArgs = isWin ? ['/d', '/s', '/c', '"' + command + '"'] : ['-c', command];
+  let timedOut = false, killTimer;
+  const child = execDetached(shell, shellArgs, { cwd: root, detached: !isWin, windowsVerbatimArguments: isWin, windowsHide: true }, (err, stdout, stderr) => {
+    clearTimeout(killTimer);
+    if (err && err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') killProcessTree(child, true); // execFile only kills the shell, not its children
     const t = activeTurns.get(conversationId);
     if (t) t.activeChild = null;
     const out = (stdout || '').slice(0, 8000);
     const errOut = (stderr || '').slice(0, 4000);
-    if (err && err.killed) return settle('Command timed out or was cancelled.\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
+    if (err && (err.killed || timedOut)) return settle('Error: command timed out or was cancelled.\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
     if (err) return settle('Exit code ' + err.code + '\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
     settle('Exit code 0\n' + out + (errOut ? '\n--- stderr ---\n' + errOut : ''));
   });
   const t = activeTurns.get(conversationId);
   if (t) t.activeChild = child;
+  killTimer = setTimeout(() => { timedOut = true; killProcessTree(child); }, 60000);
 }
 
 function stageCommandExecution(root, command, emit, conversationId) {
   return new Promise((settle) => {
     if (!ENABLE_SHELL_TOOL) return settle('Error: shell execution is disabled on this server.');
     if (!command || typeof command !== 'string') return settle('Error: command is required');
-    if (SENSITIVE_FILE_RX.test(command)) return settle('Error: command references a secrets/key file and is blocked — output would be sent to a cloud-hosted model.');
+    if (command.split(/[\s"'\x60;&|<>()=,]+/).some(tok => tok && tok !== 'config' && SENSITIVE_FILE_RX.test(tok))) return settle('Error: command references a secrets/key file and is blocked — output would be sent to a cloud-hosted model.');
     if (SHELL_BLOCKLIST.some(rx => rx.test(command))) return settle('Error: command blocked by safety policy.');
     if (!REQUIRE_COMMAND_APPROVAL) return runShellCommand(root, command, settle, conversationId);
 
@@ -759,7 +855,7 @@ function stageCommandExecution(root, command, emit, conversationId) {
       onDecision: (approved) => {
         clearTimeout(timeout);
         emit({ type: 'command_decided', pendingId, approved });
-        if (approved) runShellCommand(root, command, settle, conversationId);
+        if (approved) { try { runShellCommand(root, command, settle, conversationId); } catch (e) { settle('Error: could not start command: ' + e.message); } }
         else settle('The user rejected running this command: "' + command + '". Do not retry it — ask what they want instead.');
       }
     });
@@ -767,7 +863,10 @@ function stageCommandExecution(root, command, emit, conversationId) {
 }
 
 function computeDiff(oldContent, newContent) {
-  return diffLines(oldContent || '', newContent).map(part => ({
+  const o = oldContent || '';
+  const parts = diffLines(o, newContent, { maxEditLength: 2000, timeout: 300 }) ||
+    [...(o ? [{ removed: true, value: o }] : []), { added: true, value: newContent }];
+  return parts.map(part => ({
     added: !!part.added, removed: !!part.removed, value: part.value
   }));
 }
@@ -780,17 +879,33 @@ function stageFileChange(root, relPath, opts, emit, conversationId) {
     if (SENSITIVE_FILE_RX.test(relPath)) return settle('Error: writing to this file is blocked (matches a secrets/key pattern).');
     let p;
     try { p = safeResolve(root, relPath); } catch (e) { return settle('Error: ' + e.message); }
+    try { // re-check the RESOLVED path and its real target: ".env/", "./x/../.env" and symlinks to secrets bypass the raw-string test
+      const realRoot = fs.realpathSync(root);
+      let probe = p; while (!fs.existsSync(probe) && path.dirname(probe) !== probe) probe = path.dirname(probe);
+      const realTarget = path.join(fs.realpathSync(probe), path.relative(probe, p));
+      if (SENSITIVE_FILE_RX.test(path.relative(path.resolve(root), p)) || SENSITIVE_FILE_RX.test(path.relative(realRoot, realTarget))) return settle('Error: writing to this file is blocked (matches a secrets/key pattern).');
+    } catch {}
     const exists = fs.existsSync(p);
     const currentContent = exists ? fs.readFileSync(p, 'utf8') : '';
 
     let finalContent;
     if (opts.isEdit) {
-      const count = currentContent.split(opts.oldStr).length - 1;
+      let oldStr = String(opts.oldStr ?? ''), newStr = String(opts.newStr ?? '');
+      if (!oldStr) return settle('Error: old_str is required.');
+      let count = currentContent.split(oldStr).length - 1;
+      if (count === 0 && currentContent.includes('\r\n') && oldStr.includes('\n') && !oldStr.includes('\r\n')) { // CRLF file, LF model output
+        const crlfOld = oldStr.replace(/\n/g, '\r\n');
+        const c2 = currentContent.split(crlfOld).length - 1;
+        if (c2 > 0) { oldStr = crlfOld; newStr = newStr.replace(/\r?\n/g, '\r\n'); count = c2; }
+      }
       if (count === 0) return settle('Error: old_str not found in ' + relPath + '. Read the file again and copy the exact text.');
       if (count > 1) return settle('Error: old_str matches ' + count + ' times in ' + relPath + ' — add more surrounding context to make it unique.');
-      finalContent = currentContent.replace(opts.oldStr, opts.newStr);
+      if (currentContent.includes('\r\n') && !/(^|[^\r])\n/.test(currentContent)) newStr = newStr.replace(/\r?\n/g, '\r\n'); // pure-CRLF file: keep it pure
+      finalContent = currentContent.replace(oldStr, () => newStr);
     } else {
+      if (typeof opts.content !== 'string') return settle('Error: write_file requires a string "content" argument.');
       finalContent = opts.content;
+      if (exists && typeof finalContent === 'string' && currentContent.includes('\r\n') && !/(^|[^\r])\n/.test(currentContent)) finalContent = finalContent.replace(/\r?\n/g, '\r\n');
     }
 
     const writeAndSettle = (note) => {
@@ -819,7 +934,7 @@ function stageFileChange(root, relPath, opts, emit, conversationId) {
       onDecision: (approved) => {
         clearTimeout(timeout);
         emit({ type: 'diff_decided', pendingId, approved });
-        if (approved) writeAndSettle(' (approved by user)');
+        if (approved) { try { writeAndSettle(' (approved by user)'); } catch (e) { settle('Error: could not apply change to ' + relPath + ': ' + e.message); } }
         else settle('Change to ' + relPath + ' was rejected by the user. Do not reapply the same edit — ask what they want instead.');
       }
     });
@@ -839,6 +954,7 @@ function summarizeArgs(toolName, args) {
 
 async function resolveToolCalls(messages, projectRoot, model, conversationId, emit, editedFiles = new Set()) {
   const readCache = new Map();
+  const pinnedIdx = messages.length - 1; // index of the current user request
   let totalPromptTokens = 0, totalEvalTokens = 0;
   for (let i = 0; i < MAX_TOOL_CALLS; i++) {
     const turn = activeTurns.get(conversationId);
@@ -847,7 +963,7 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
       const notes = turn.queue.splice(0).join('\n');
       messages.push({ role: 'user', content: '[Steering note from user — apply this now]: ' + notes });
     }
-    enforceToolBudget(messages, TOOL_LOOP_CHAR_BUDGET);
+    enforceToolBudget(messages, TOOL_LOOP_CHAR_BUDGET, pinnedIdx);
     let data;
     try {
       data = await ollamaChatStream(messages, PROJECT_TOOLS, model, conversationId, chunk => emit({ token: chunk }));
@@ -864,18 +980,28 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
     totalEvalTokens += data.eval_count || 0;
     const msg = data.message || {};
     if (!msg.tool_calls || !msg.tool_calls.length) {
+      const late = activeTurns.get(conversationId);
+      if (late && late.queue.length && !late.aborted) {
+        emit({ type: 'stream_reset' });
+        messages.push({ role: 'assistant', content: msg.content || '' });
+        messages.push({ role: 'user', content: '[Steering note from user — apply this now]: ' + late.queue.splice(0).join('\n') });
+        continue;
+      }
       return { content: msg.content || '', promptTokens: totalPromptTokens, evalTokens: totalEvalTokens, editedFiles: [...editedFiles] };
     }
     emit({ type: 'stream_reset' });
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
     let touchedFiles = false;
     for (const call of msg.tool_calls) {
+      const tNow = activeTurns.get(conversationId);
+      if (tNow && tNow.aborted) { messages.push({ role: 'tool', content: 'Cancelled: the user stopped this turn.', tool_call_id: call.id || (conversationId + ':' + i + ':cancelled') }); continue; }
       const args = call.function.arguments || {};
       let result;
       const callId = call.id || (conversationId + ':' + i + ':' + Math.random().toString(36).slice(2, 8));
       emit({ type: 'tool_start', callId, tool: call.function.name, args: summarizeArgs(call.function.name, args) });
       const startedAt = Date.now();
       try {
+        if (call.function.name !== 'read_file') readCache.clear(); // any write/edit/command may change disk state
         if (call.function.name === 'read_file') {
           if (readCache.has(args.path)) { result = readCache.get(args.path); }
           else { result = toolReadFile(projectRoot, args.path); readCache.set(args.path, result); }
@@ -896,7 +1022,7 @@ async function resolveToolCalls(messages, projectRoot, model, conversationId, em
       emit({ type: 'tool_end', callId, tool: call.function.name, ms: Date.now() - startedAt, ok: !result.startsWith('Error') && !result.startsWith('No index found'), preview: (result || '').slice(0, 300) });
       messages.push({ role: 'tool', content: result, tool_call_id: call.id || callId });
     }
-    if (touchedFiles) codeIndex.buildIndex(projectRoot).catch(() => {}); // fire-and-forget, now the edits are actually on disk
+    if (touchedFiles && codeIndex.getStatus(projectRoot).status !== 'none') codeIndex.buildIndex(projectRoot).catch(() => {}); // only refresh an index the user already built // fire-and-forget, now the edits are actually on disk
   }
   return {
     content: '[Read/edited files but hit the ' + MAX_TOOL_CALLS + '-call limit. Ask about a narrower part of the project.]',
@@ -976,7 +1102,7 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
     const payload = JSON.stringify({ model, messages, tools, stream: true, keep_alive: OLLAMA_KEEP_ALIVE, options: { num_ctx: OLLAMA_NUM_CTX, num_predict: OLLAMA_NUM_PREDICT } });
     const u = new URL(OLLAMA_HOST + '/api/chat');
     const mod = u.protocol === 'https:' ? require('https') : require('http');
-    let content = '', toolCalls = null, promptTokens = 0, evalTokens = 0, buf = '', steered = false;
+    let content = '', toolCalls = null, promptTokens = 0, evalTokens = 0, buf = '', steered = false, sawDone = false;
     const checkSteer = () => {
       if (steered) return;
       const turn = activeTurns.get(conversationId);
@@ -996,6 +1122,13 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
       path: u.pathname, method: 'POST',
       headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}, timeout: 300000
     }, res => {
+      if (res.statusCode !== 200) { // 429 quota / 401 not signed in / 404 / 5xx: reject so the fallback chain and the UI actually see it
+        let eb = '';
+        res.on('data', c => { if (eb.length < 2000) eb += c; });
+        res.on('end', () => { clearInterval(steerPoll); if (!steered) { const e = new Error('Ollama error ' + res.statusCode + ': ' + eb.slice(0, 500)); e.status = res.statusCode; reject(e); } });
+        res.on('error', err => { clearInterval(steerPoll); if (!steered) reject(err); });
+        return;
+      }
       res.on('data', chunk => {
         buf += chunk.toString('utf8');
         const lines = buf.split('\n');
@@ -1004,13 +1137,21 @@ function ollamaChatStream(messages, tools, model, conversationId, onToken) {
           const t = line.trim();
           if (!t) continue;
           let data; try { data = JSON.parse(t); } catch { continue; }
-          if (data.message && data.message.tool_calls && data.message.tool_calls.length) toolCalls = data.message.tool_calls;
+          if (data.error) { clearInterval(steerPoll); r.destroy(); reject(new Error('Ollama error: ' + data.error)); return; } // mid-stream {"error":...} line
+          if (data.message && data.message.tool_calls && data.message.tool_calls.length) toolCalls = (toolCalls || []).concat(data.message.tool_calls);
           if (data.message && data.message.content) { content += data.message.content; onToken(data.message.content); }
-          if (data.done) { promptTokens = data.prompt_eval_count || 0; evalTokens = data.eval_count || 0; }
+          if (data.done) { sawDone = true; promptTokens = data.prompt_eval_count || 0; evalTokens = data.eval_count || 0; }
         }
         checkSteer();
       });
-      res.on('end', () => { clearInterval(steerPoll); if (!steered) resolve({ message: { content, tool_calls: toolCalls }, prompt_eval_count: promptTokens, eval_count: evalTokens }); });
+      res.on('end', () => {
+        clearInterval(steerPoll);
+        if (steered) return;
+        let tail = null; try { tail = JSON.parse(buf.trim()); } catch {}
+        if (tail && tail.done) { sawDone = true; promptTokens = tail.prompt_eval_count || 0; evalTokens = tail.eval_count || 0; }
+        if (!sawDone) return reject(new Error('Ollama closed the stream before the response was complete.'));
+        resolve({ message: { content, tool_calls: toolCalls }, prompt_eval_count: promptTokens, eval_count: evalTokens });
+      });
       res.on('error', err => { clearInterval(steerPoll); if (!steered) reject(err); });
     });
     r.on('error', err => { clearInterval(steerPoll); if (!steered) reject(err); });
@@ -1071,9 +1212,19 @@ app.get('/api/project/index/status', (req, res) => {
 });
 
 function toolSearchCodebase(root, query, topK) {
-  return codeIndex.search(root, query, topK || 8).then(r =>
-    r.error ? r.error : r.map(x => '--- ' + x.path + ':' + x.startLine + '-' + x.endLine + ' (score ' + x.score + ') ---\n' + x.text).join('\n\n')
-  );
+  const k = Math.min(Math.max(parseInt(topK, 10) || 8, 1), 20);
+  const CAP = Math.floor(TOOL_LOOP_CHAR_BUDGET * 0.4); // a single result must stay well under what enforceToolBudget collapses
+  return codeIndex.search(root, query, k).then(r => {
+    if (r.error) return r.error;
+    let out = '';
+    for (const x of r) {
+      const part = '--- ' + x.path + ':' + x.startLine + '-' + x.endLine + ' (score ' + x.score + ') ---\n' + x.text;
+      const next = out ? out + '\n\n' + part : part;
+      if (next.length > CAP) { out = out || part.slice(0, CAP); out += '\n[...remaining matches omitted to fit the context budget — refine the query]'; break; }
+      out = next;
+    }
+    return out;
+  });
 }
 
 app.get('/api/project/file', (req, res) => {
@@ -1100,6 +1251,7 @@ app.get('/api/project/file', (req, res) => {
 
     const realRoot = fs.realpathSync(root);
     const realP = fs.realpathSync(p);
+    if (SENSITIVE_FILE_RX.test(path.relative(root, p)) || SENSITIVE_FILE_RX.test(path.relative(realRoot, realP))) return res.status(403).json({ error: 'Blocked: file matches a secrets/key pattern' });
     if (!(realP === realRoot || realP.startsWith(realRoot + path.sep))) {
       return res.status(403).json({ error: 'Path outside opened project root (symlink)' });
     }
@@ -1127,7 +1279,9 @@ app.get('/api/conversations/:id/events', (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (req, resRaw) => {
+  // 'timeout' -> r.destroy() also fires 'error'; a 2nd res.json() throws ERR_HTTP_HEADERS_SENT -> uncaughtException -> process.exit(1).
+  const res = { json: (o) => { if (!resRaw.headersSent) resRaw.json(o); } };
   const u = new URL(OLLAMA_HOST + '/api/tags');
   const mod = u.protocol === 'https:' ? require('https') : require('http');
   const r = mod.get({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname, timeout: 3000 }, ollamaRes => {
@@ -1141,7 +1295,7 @@ app.get('/api/health', (req, res) => {
 // Safety net: guarantees every route returns JSON, never a raw HTML 500 page.
 app.use((err, req, res, next) => {
   log.error('[unhandled]', err.message);
-  if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
+  if (!res.headersSent) { const st = err.status || err.statusCode || (err.name === 'MulterError' ? (err.code === 'LIMIT_FILE_SIZE' ? 413 : 400) : 500); res.status(st >= 400 && st < 600 ? st : 500).json({ error: err.message || 'Internal server error' }); }
 });
 
 setInterval(() => {
@@ -1182,7 +1336,7 @@ function trimHistoryToBudget(history, maxChars) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 function waitForKeyThenExit(code) {
-  if (!isPkg) return process.exit(code);
+  if (!isPkg || !process.stdin.isTTY) return process.exit(code); // no console to press a key in (pipe/service/CI): exit instead of hanging forever
   console.log('\nPress any key to exit...');
   try { process.stdin.setRawMode(true); } catch {}
   process.stdin.resume();
@@ -1205,6 +1359,7 @@ function checkOllama() {
     const mod = u.protocol === 'https:' ? require('https') : require('http');
     const r = mod.get({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname, timeout: 4000 }, res => {
       let data = ''; res.on('data', c => data += c);
+      res.on('close', () => { if (!res.complete) resolve({ ok: true, models: [] }); }); // reachable, body cut mid-response
       res.on('end', () => { try { resolve({ ok: true, models: (JSON.parse(data).models || []).map(m => m.name) }); } catch { resolve({ ok: true, models: [] }); } });
     });
     r.on('timeout', () => { r.destroy(); resolve({ ok: false }); });
@@ -1231,9 +1386,10 @@ async function runPreflightChecks() {
 }
 
 (async () => {
-  if (!(await runPreflightChecks())) return;
+  if (!SHARED_TOKEN || !(await runPreflightChecks())) return;
   db.init().then(() => {
     const server = app.listen(PORT, '0.0.0.0', () => {
+      global.__srv = server;
       const tsIp = detectTailscaleIP();
       log.info('Ollama Chat running at http://localhost:' + PORT + '/?token=' + SHARED_TOKEN);
       if (tsIp) log.info('Tailscale (phone) URL: http://' + tsIp + ':' + PORT + '/?token=' + SHARED_TOKEN);
@@ -1245,13 +1401,16 @@ async function runPreflightChecks() {
         if (shuttingDown) return;
         shuttingDown = true;
         log.info('Shutting down: closing active streams and flushing database...');
-        for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild); }
+        for (const [, turn] of activeTurns) { turn.aborted = true; turn.activeRequest?.destroy(); killProcessTree(turn.activeChild, true); }
         try { db.flushSync(); } catch (e) { log.error('DB flush failed:', e.message); }
         server.close(() => { log.info('Shutdown complete.'); process.exit(0); });
         setTimeout(() => process.exit(0), 2000);
       }
       process.on('SIGINT', shutdown);
       process.on('SIGTERM', shutdown);
+      process.on('SIGHUP', shutdown); // Windows console-window close
+      if (process.platform === 'win32') process.on('SIGBREAK', shutdown);
+      process.on('exit', () => { try { db.flushSync(); } catch {} }); // covers every process.exit() path
     });
     server.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {

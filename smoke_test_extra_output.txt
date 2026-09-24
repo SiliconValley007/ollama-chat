@@ -1,0 +1,16 @@
+PS D:\My_Projects\claude-projects\claude-chat> python .\smoke_test_extra.py --with-exe
+Starting mock Ollama on 127.0.0.1:11435 ...
+Starting ollama-chat server.js on port 3001 ...
+[PASS] codeIndex survives /api/embeddings mid-drop, recovers on retry
+[PASS] Concurrent attachment uploads (8 parallel) — no crash, all complete
+[PASS] Server responsive after concurrent-upload burst
+Building .exe (npm run build:win) — this can take a minute...
+[PASS] pkg .exe build + run (npm run build:win, then launch + /api/health)
+
+=== Summary ===
+PASS codeIndex survives /api/embeddings mid-drop, recovers on retry
+PASS Concurrent attachment uploads (8 parallel) — no crash, all complete
+PASS Server responsive after concurrent-upload burst
+PASS pkg .exe build + run (npm run build:win, then launch + /api/health)
+4/4 passed
+PS D:\My_Projects\claude-projects\claude-chat> 
